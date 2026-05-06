@@ -20,6 +20,7 @@ const TrayIconChooser = require("../browser/tools/trayIconChooser");
 require("../appConfiguration");
 const ConnectionManager = require("../connectionManager");
 const BrowserWindowManager = require("../mainAppWindow/browserWindowManager");
+const { injectTeamsPresence } = require("../browser/teamsPresenceInjection");
 const os = require("node:os");
 const path = require("node:path");
 
@@ -899,6 +900,7 @@ function onDidFinishLoad() {
 
   // Inject browser functionality
   injectScreenSharingLogic();
+  injectTeamsPresence(window.webContents, config);
 
   customCSS.onDidFinishLoad(window.webContents, config);
   initSystemThemeFollow(config);

@@ -62,12 +62,15 @@ function addEventListeners() {
   globalThis.addEventListener("keydown", keyDownEventHandler, false);
   globalThis.addEventListener("wheel", wheelEventHandler, { passive: false });
   whenIframeReady((iframe) => {
-    iframe.contentDocument.addEventListener(
-      "keydown",
-      keyDownEventHandler,
-      false,
-    );
-    iframe.contentDocument.addEventListener("wheel", wheelEventHandler, {
+    const doc = iframe.contentDocument;
+    if (!doc) {
+      console.warn(
+        "[SHORTCUTS] iframe contentDocument unavailable (often cross-origin); skipping iframe listeners",
+      );
+      return;
+    }
+    doc.addEventListener("keydown", keyDownEventHandler, false);
+    doc.addEventListener("wheel", wheelEventHandler, {
       passive: false,
     });
   });

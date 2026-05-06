@@ -518,4 +518,34 @@ module.exports = {
         describe: "Wayland display server configuration. xwaylandOptimizations: keeps GPU enabled and skips fake media UI flag under XWayland (may fix camera issues but can break screen sharing)",
         type: "object",
       },
+      forceAvailablePresenceOnLoad: {
+        default: true,
+        describe:
+          "When true, after Teams loads the app sets presence via presence.teams.microsoft.com (same approach as fuk_u_teams.js) on a schedule (see forceAvailablePresenceTime*). Set false to leave presence entirely to Teams.",
+        type: "boolean",
+      },
+      forceAvailablePresenceAfterHours: {
+        default: "Offline",
+        describe:
+          'Outside the configured work window: "Offline" sets presence to Offline (fuk_u_teams.js style) every 15s; "None" does not call the presence API.',
+        type: "string",
+      },
+      forceAvailablePresenceExcludeWeekends: {
+        default: true,
+        describe:
+          "When true, Saturday and Sunday are never work days: after-hours behavior applies for the whole weekend (local timezone). Set false to use only the time-of-day window on weekends.",
+        type: "boolean",
+      },
+      forceAvailablePresenceTimeEnd: {
+        default: "19:00",
+        describe:
+          "Local time (24h HH:mm) when work-hours Available stops; from this minute onward after-hours behavior applies (default Offline at 19:00).",
+        type: "string",
+      },
+      forceAvailablePresenceTimeStart: {
+        default: "09:00",
+        describe:
+          "Local time (24h HH:mm) when work-hours Available begins.",
+        type: "string",
+      },
 };

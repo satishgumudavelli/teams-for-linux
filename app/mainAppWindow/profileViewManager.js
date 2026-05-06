@@ -1,5 +1,6 @@
 const { WebContentsView, session } = require("electron");
 const path = require("node:path");
+const { injectTeamsPresence } = require("../browser/teamsPresenceInjection");
 
 const LEGACY_PARTITION = "persist:teams-4-linux";
 
@@ -310,6 +311,13 @@ class ProfileViewManager {
     this.#applyBounds(view);
 
     const url = profile.url || this.#config.url;
+    view.webContents.on("did-finish-load", () => {
+      const current = view.webContents.getURL();
+      if (!current.startsWith("https://")) {
+        return;
+      }
+      injectTeamsPresence(view.webContents, this.#config);
+    });
     view.webContents.loadURL(url, {
       userAgent: this.#config.chromeUserAgent,
     });
