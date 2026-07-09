@@ -148,6 +148,42 @@ For configuration options, see [Configuration](configuration.md). For developmen
 
 ---
 
+#### Issue: System tray icon missing on Ubuntu Unity
+
+**Description:** On Ubuntu Unity the Teams for Linux system tray icon does not appear in the top panel. Recent Chromium and Electron dropped support for the legacy libappindicator library that Unity requires, and now expose the tray only through the newer KStatusNotifierItem protocol, so the icon never registers. This is an upstream Electron limitation rather than a Teams for Linux bug.
+
+**Potential Causes:**
+* Chromium/Electron no longer ship libappindicator support, exposing the tray only via KStatusNotifierItem
+* Unity uses libappindicator and does not implement KStatusNotifierItem, so no icon appears
+
+**Solutions/Workarounds:**
+
+Unsetting the `XDG_CURRENT_DESKTOP` environment variable for the app restores the tray on Unity. Rather than editing the packaged `.desktop` file (overwritten on every upgrade), drop an override that shadows it and survives updates.
+
+1. **Per-user override** (recommended for a single machine):
+   ```bash
+   mkdir -p ~/.local/share/applications
+   cp /usr/share/applications/teams-for-linux.desktop ~/.local/share/applications/
+   sed -i 's|^Exec=|Exec=env -u XDG_CURRENT_DESKTOP |' ~/.local/share/applications/teams-for-linux.desktop
+   ```
+
+2. **System-wide override** (for an OEM or fleet image, applies to all users):
+   ```bash
+   sudo mkdir -p /usr/local/share/applications
+   sudo cp /usr/share/applications/teams-for-linux.desktop /usr/local/share/applications/
+   sudo sed -i 's|^Exec=|Exec=env -u XDG_CURRENT_DESKTOP |' /usr/local/share/applications/teams-for-linux.desktop
+   ```
+
+Both locations sit ahead of `/usr/share/applications` in `XDG_DATA_DIRS`, so they shadow the packaged entry and are not touched by `apt upgrade`. The override keeps the default `--ozone-platform=x11` flag intact.
+
+**Note:** `XDG_CURRENT_DESKTOP` also drives the xdg desktop portals (screen sharing, file pickers) and GTK theming, so only unset it where you actually need the tray. The icon may also come up generic rather than the purple Teams logo (see #888).
+
+**Status:** Upstream Electron limitation ([electron/electron#38979](https://github.com/electron/electron/issues/38979)); no fix on the Teams for Linux side.
+
+**Related GitHub Issues:** [Issue #2680](https://github.com/IsmaelMartinez/teams-for-linux/issues/2680), [Issue #888](https://github.com/IsmaelMartinez/teams-for-linux/issues/888)
+
+---
+
 ### Audio and Video Issues
 
 #### Issue: Microphone not working during calls
@@ -306,6 +342,26 @@ Since v2.7.13, report-only CSP headers are automatically stripped for all non-Te
 **Beta notes:** This feature is opt-in while hardware coverage is still being validated. The single-device restriction, assertion echo-offset heuristic, and PIN-prompt stderr detection are all areas under active validation. Please report hardware combinations (key model, Linux distribution, libfido2 version) that work or fail on the umbrella issue so we can plan the GA rollout.
 
 **Related GitHub Issues:** [Issue #802](https://github.com/IsmaelMartinez/teams-for-linux/issues/802), [PR #2357](https://github.com/IsmaelMartinez/teams-for-linux/pull/2357), [ADR 021](./development/adr/021-webauthn-fido2-linux.md).
+
+#### Issue: Google Sign-in shows "This browser or app may not be secure"
+
+**Description:** When signing in with a Google account ("Sign in with Google"), Google's password page rejects the login with "This browser or app may not be secure". Microsoft work, school, and personal accounts are unaffected.
+
+**Cause:** Google's sign-in flow inspects the browser user agent and blocks user agents it does not recognize as a trusted app or browser. Teams for Linux ships a Chrome user agent with the Electron token removed (Microsoft sign-in and calls misbehave when the Electron token is present), but Google's check also wants an application-identifier token in the string, which the default user agent does not carry.
+
+**Solutions/Workarounds:**
+
+Set a custom `chromeUserAgent` in your `config.json` file (see the [Installation and Updates](#installation-and-updates) section for the configuration folder path corresponding to your installation method) so the user agent carries an application-identifier token, then restart the app. Take the default user agent from the [configuration reference](configuration.md) and insert a token such as `teams-for-linux/1.0` before the `Chrome/...` segment:
+
+```json
+{
+  "chromeUserAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) teams-for-linux/1.0 Chrome/<your-chrome-version> Safari/537.36"
+}
+```
+
+Replace `<your-chrome-version>` with the Chrome version Teams for Linux reports. Any stable application-identifier token works; the requirement is only that one is present. The default user agent is intentionally left without one, because changing it for everyone would risk other Microsoft sign-in methods and calls.
+
+**Related GitHub Issues:** [Issue #2646](https://github.com/IsmaelMartinez/teams-for-linux/issues/2646), [Issue #1414](https://github.com/IsmaelMartinez/teams-for-linux/issues/1414)
 
 ---
 

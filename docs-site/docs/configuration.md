@@ -73,6 +73,20 @@ Place your `config.json` file in the appropriate location based on your installa
 > [!NOTE]
 > [yargs](https://www.npmjs.com/package/yargs) supports multiple configuration methods—refer to their documentation if you prefer using a configuration file over command-line arguments.
 
+## Startup Validation
+
+At startup the app validates your `config.json` against the option schema and logs any problems as `[CONFIG]` warnings. This is **warn-only**: an invalid entry is reported and then ignored, never blocking startup or changing existing behaviour. It catches the common mistakes:
+
+- **Unknown options** — typos or options from a different app version.
+- **Wrong types** — for example a string where a number is expected.
+- **Invalid `choices`** — a value outside an option's allowed set.
+
+Nested keys of object options (such as `mqtt.homeAssistant.enabled`) are checked the same way. Warnings name only the offending key, the expected type, and any allowed values — never your configured values, which may contain URLs, tokens, or email addresses.
+
+:::note
+Each option's **Apply** mode (whether a change takes effect immediately or after a restart) is listed in the [auto-generated reference](configuration-generated.md) and the [config explorer](configuration-explorer.mdx).
+:::
+
 ## Configuration Options Reference
 
 ### Application Core
@@ -125,6 +139,7 @@ Place your `config.json` file in the appropriate location based on your installa
 | `customNotification` | `object` | `{ toastDuration: 5000 }` | Configuration for custom in-app toast notifications (used when `notificationMethod` is `custom`) |
 | `defaultNotificationUrgency` | `string` | `"normal"` | Default urgency for new notifications. Choices: `low`, `normal`, `critical` |
 | `notifications.timeoutType` | `string` | `"default"` | How long notifications stay in the system notification center (Linux/Windows only). Choices: `default` (auto-clear per system policy) or `never` (persist until the user dismisses, useful on GNOME and other desktops that auto-remove notifications). Mirrors Electron's Notification `timeoutType`. May not be honoured by every notification daemon. |
+| `notifications.electron.clickAction` | `string` | `"show"` | What clicking a notification does to the main window (`notificationMethod: "electron"` only). Choices: `show` (reveal the window, current behaviour), `restore` (also un-minimise and focus, which helps on GNOME where a plain show does not raise the window) or `none` (do nothing). On Linux whether focus is honoured depends on the window manager. |
 
 ### Incoming Call Handling
 
@@ -346,6 +361,7 @@ Media settings are organized under the `media` configuration object with subgrou
 |--------|------|---------|-------------|
 | `media.microphone.disableAutogain` | `boolean` | `false` | Disable microphone auto gain control - prevents Teams from automatically adjusting microphone volume levels. Useful for professional audio setups or when manual gain control is preferred |
 | `media.microphone.speakingIndicator` | `boolean` | `false` | Enable visual overlay showing microphone state during calls (speaking/silent/muted). When enabled, also provides WebRTC-based call state detection. Note: when `mqtt.enabled` is true, the WebRTC call detection activates automatically even without this option, ensuring reliable `in-call` topic publishing |
+| `media.microphone.ignoreSystemMute` | `boolean` | `false` | Stop Teams' mute button from following the operating system microphone mute on Linux. Chromium polls the OS capture source and reports its mute to the page as a `MediaStreamTrack` mute event, which Teams mirrors onto its own button. Enable this to keep the Teams button where you left it and rely solely on your system/hotkey mute, which still cuts the transmitted audio. Only the local capture track is affected; remote participants' mute state stays visible |
 | `media.microphone.overrideConstraints.enabled` | `boolean` | `false` | Enable overriding the microphone audio constraints Teams requests via `getUserMedia`. Lets users disable WebRTC APM processing (echo cancellation, noise suppression, auto gain control) or pin `channelCount` / `sampleRate` at the Chromium/WebRTC layer — the Linux equivalent of "High fidelity music mode" (Windows-only in the official Teams client). Only the keys you set are overridden; omitted keys are left untouched. |
 | `media.microphone.overrideConstraints.echoCancellation` | `boolean` | - | When set, overrides `getUserMedia`'s `echoCancellation` constraint. Omit to leave it untouched. |
 | `media.microphone.overrideConstraints.noiseSuppression` | `boolean` | - | When set, overrides `getUserMedia`'s `noiseSuppression` constraint. Omit to leave it untouched. |
