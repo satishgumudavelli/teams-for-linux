@@ -7,8 +7,12 @@ const closeBtn = document.getElementById("close-btn");
 // keep the UI from accepting absurd lengths into the Settings store.
 const NAME_MAX_LENGTH = 64;
 
-let currentState = { profiles: [], activeId: null };
+let currentState = { profiles: [], activeId: null, shortcutsAvailable: false };
 let editingId = null;
+// `data-focus-key` of the control that should regain focus after the next
+// render — toggling a pin or flag rebuilds the list, which would otherwise
+// drop keyboard focus to <body>.
+let focusAfterRender = null;
 
 function clearError() {
   errorMessage.textContent = "";
@@ -132,6 +136,135 @@ async function commitRename(id, raw) {
   }
 }
 
+// Mirrors MAX_PINNED in ProfilesManager (the Ctrl+Alt+1…5 shortcut slots).
+// Main enforces the cap authoritatively; this just disables the button so the
+// user isn't offered an action that would be rejected.
+const MAX_PINNED = 5;
+
+// Guard focus against the rename input's blur-commit: without this, pressing
+// a row button while a rename is open blurs the input, which commits and
+// re-renders synchronously — detaching the pressed button between mousedown
+// and mouseup so Chromium drops the click entirely.
+function guardFocus(btn) {
+  btn.addEventListener("mousedown", (e) => e.preventDefault());
+}
+
+function makePinButton(profile, pinnedCount, slot) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "profile-pin-btn" + (profile.pinned ? " pinned" : "");
+  btn.dataset.profileId = profile.id;
+  btn.dataset.focusKey = `${profile.id}:pin`;
+  btn.setAttribute("aria-pressed", String(!!profile.pinned));
+  // Only show the chord when it can actually fire (the accelerator lives on
+  // the per-window menu, absent on macOS — main tells us via state).
+  const chord = currentState.shortcutsAvailable ? `Ctrl+Alt+${slot}` : null;
+  if (profile.pinned) {
+    btn.textContent = chord ? `Unpin (${chord})` : "Unpin";
+    btn.title = chord ? `Pinned — switch with ${chord}` : "Pinned";
+  } else {
+    btn.textContent = "Pin";
+    if (pinnedCount >= MAX_PINNED) {
+      btn.disabled = true;
+      btn.title = `At most ${MAX_PINNED} profiles can be pinned`;
+    } else {
+      btn.title = currentState.shortcutsAvailable
+        ? "Pin for a Ctrl+Alt keyboard shortcut"
+        : "Pin this profile";
+    }
+  }
+  if (!btn.disabled) {
+    guardFocus(btn);
+    btn.addEventListener("click", async () => {
+      clearError();
+      // Remember where focus should land after the state push re-renders the
+      // list — set BEFORE the await, since the push can arrive first.
+      focusAfterRender = btn.dataset.focusKey;
+      try {
+        const result = await globalThis.manageProfileApi.pin(
+          profile.id,
+          !profile.pinned
+        );
+        if (result?.ok === false) {
+          // Rejected (e.g. the max-5 cap): no state push follows, so render()
+          // won't run — clear the pending focus target or the next unrelated
+          // render would yank focus onto this button.
+          focusAfterRender = null;
+          setError(result.error || "Failed to update pin.");
+        }
+      } catch (error) {
+        focusAfterRender = null;
+        setError(error?.message || "Failed to update pin.");
+      }
+    });
+  }
+  return btn;
+}
+
+// The stored flags are "off" switches (disableNotifications, muted), so a
+// checked box means on.
+function makeFlagToggle(profile, key, label, offTitle) {
+  const wrap = document.createElement("label");
+  wrap.className = "profile-flag";
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  box.checked = !profile[key];
+  box.dataset.focusKey = `${profile.id}:${key}`;
+  if (!box.checked) wrap.title = offTitle;
+  guardFocus(wrap);
+  box.addEventListener("change", async () => {
+    clearError();
+    focusAfterRender = box.dataset.focusKey;
+    const revert = (message) => {
+      focusAfterRender = null;
+      box.checked = !box.checked;
+      setError(message);
+    };
+    try {
+      const result = await globalThis.manageProfileApi.setNotificationFlags(
+        profile.id,
+        { [key]: !box.checked }
+      );
+      if (result?.ok === false) {
+        revert(result.error || "Failed to update notifications.");
+      }
+    } catch (error) {
+      revert(error?.message || "Failed to update notifications.");
+    }
+  });
+  wrap.append(box, document.createTextNode(label));
+  return wrap;
+}
+
+function makeProfileMain(profile, isActive) {
+  const main = document.createElement("div");
+  main.className = "profile-main";
+  const nameLine = document.createElement("div");
+  nameLine.className = "profile-name-line";
+  nameLine.append(makeNameElement(profile));
+  // Beside the name rather than in the row: the row's buttons already crowd
+  // this column, and the checkboxes below need its width.
+  if (isActive) {
+    const badge = document.createElement("span");
+    badge.className = "profile-active-badge";
+    badge.textContent = "Active";
+    nameLine.append(badge);
+  }
+  const flags = document.createElement("div");
+  flags.className = "profile-flags";
+  flags.append(
+    makeFlagToggle(
+      profile,
+      "disableNotifications",
+      "Notifications",
+      "Notifications from this profile are off"
+    ),
+    makeFlagToggle(profile, "muted", "Sound", "Sounds from this profile are muted")
+  );
+  main.append(nameLine, flags);
+  return main;
+}
+
 function makeRemoveButton(profile, isActive, isLastRemaining) {
   const btn = document.createElement("button");
   btn.type = "button";
@@ -144,6 +277,7 @@ function makeRemoveButton(profile, isActive, isLastRemaining) {
     btn.disabled = true;
     btn.title = "Cannot remove the last profile";
   } else {
+    guardFocus(btn);
     btn.addEventListener("click", () => {
       globalThis.manageProfileApi.remove(profile.id);
     });
@@ -154,6 +288,10 @@ function makeRemoveButton(profile, isActive, isLastRemaining) {
 function render() {
   profileList.replaceChildren();
   const total = currentState.profiles.length;
+  const pinnedCount = currentState.profiles.filter((p) => p.pinned).length;
+  // Slot numbers mirror the menu accelerators: 1-based position among the
+  // pinned profiles in list order (see app/menus/profilesMenu.js).
+  let nextSlot = 0;
   for (const profile of currentState.profiles) {
     const li = document.createElement("li");
     li.className = "profile-row";
@@ -161,16 +299,19 @@ function render() {
     if (isActive) {
       li.classList.add("active");
     }
+    const slot = profile.pinned ? ++nextSlot : null;
     li.append(makeAvatar(profile));
-    li.append(makeNameElement(profile));
-    if (isActive) {
-      const badge = document.createElement("span");
-      badge.className = "profile-active-badge";
-      badge.textContent = "Active";
-      li.append(badge);
-    }
+    li.append(makeProfileMain(profile, isActive));
+    li.append(makePinButton(profile, pinnedCount, slot));
     li.append(makeRemoveButton(profile, isActive, total === 1));
     profileList.append(li);
+  }
+  if (focusAfterRender) {
+    const control = profileList.querySelector(
+      `[data-focus-key="${CSS.escape(focusAfterRender)}"]`
+    );
+    focusAfterRender = null;
+    control?.focus();
   }
 }
 

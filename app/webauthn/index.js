@@ -17,27 +17,38 @@
  */
 
 const { BrowserWindow, ipcMain, webFrameMain } = require("electron");
+const { setTimeout: sleep } = require("node:timers/promises");
 const fido2Backend = require("./fido2Backend");
 const { requestPinPreCollect, requestPinModal } = require("./pinDialog");
+const { showTouchPrompt } = require("./touchPrompt");
+const { DEFAULT_ORIGINS, buildAllowedOrigins } = require("./originAllowlist");
 const log = require("./log");
 
-// Defense-in-depth: only allow WebAuthn requests from known Microsoft login origins.
+// Defense-in-depth: only allow WebAuthn requests from known login origins.
 // The IPC allowlist is the primary control; this is a secondary check.
-const ALLOWED_ORIGINS = new Set([
-  "https://login.microsoftonline.com",
-  "https://login.microsoft.com",
-  "https://login.live.com",
-]);
+//
+// Federated tenants sign in on their own IdP host, which is never one of the
+// Microsoft defaults, so the ceremony was blocked outright (#2931). Extended at
+// initialize() from auth.webauthn.extraOrigins. The subframe relay in
+// app/browser/tools/webauthnOverride.js builds the same set.
+let allowedOrigins = new Set(DEFAULT_ORIGINS);
+
+// A sign-in frame outside the allowlist keeps Chromium's own WebAuthn, which
+// has no PIN or touch UI here, so the key prompt silently never appears
+// (#3008). The hint is logged once per distinct origin, as the frame loads, so
+// it lines up with the sign-in step it explains. The origin itself stays in
+// memory: an IdP host identifies the tenant, and debug logs get shared.
+const skippedOrigins = new Set();
 
 let initialized = false;
 
 /**
- * Validate that the request origin is an expected Microsoft login domain.
+ * Validate that the request origin is an allowed login origin.
  * @param {string} origin
  * @returns {boolean}
  */
 function isAllowedOrigin(origin) {
-  return ALLOWED_ORIGINS.has(origin);
+  return allowedOrigins.has(origin);
 }
 
 /**
@@ -78,47 +89,144 @@ async function collectPin(sender) {
  * @param {object} options
  */
 async function handleWebauthnRequest(operation, event, options) {
-  let origin;
+  let senderOrigin;
   try {
-    origin = event.senderFrame?.origin || new URL(event.sender.getURL()).origin;
+    senderOrigin = event.senderFrame?.origin || new URL(event.sender.getURL()).origin;
   } catch {
     log.warn("[WEBAUTHN] Blocked request", { op: operation, reason: "no-origin" });
     return { success: false, error: "SecurityError: could not determine origin" };
   }
 
-  if (!isAllowedOrigin(origin)) {
+  // A ceremony started inside a login iframe is relayed through the main frame's
+  // preload, so the IPC sender is the outer frame. The key has to sign the origin
+  // of the frame that actually called navigator.credentials, or the relying party
+  // discards an assertion we consider successful (#2828). `frameOrigin` is the
+  // browser's own MessageEvent.origin for that frame, and is held to the same
+  // allowlist as the sender before anything signs it.
+  const origin = options?.frameOrigin || senderOrigin;
+  const relayed = origin !== senderOrigin;
+
+  if (!isAllowedOrigin(senderOrigin) || !isAllowedOrigin(origin)) {
     log.warn("[WEBAUTHN] Blocked request", {
       op: operation,
       reason: "origin-not-allowed",
       originClass: log.classifyOrigin(origin),
+      hint: "if this is your federated IdP sign-in page, add it to auth.webauthn.extraOrigins",
     });
     return { success: false, error: "SecurityError: origin not allowed" };
   }
 
-  log.info("[WEBAUTHN] Processing request", { op: operation, originClass: log.classifyOrigin(origin) });
+  // timeoutSec is the timeout the relying party asked for. It is the number that
+  // tells us whether a slow ceremony (PIN entry plus waiting for the touch) can
+  // realistically outlast what the page is prepared to wait for. See #2719.
+  log.info("[WEBAUTHN] Processing request", {
+    op: operation,
+    originClass: log.classifyOrigin(origin),
+    relayed,
+    timeoutSec: options?.timeout ?? null,
+  });
+
+  // Phase timings, so a log shows how the wall-clock split between the user
+  // typing a PIN and the key waiting to be touched, rather than leaving it to be
+  // inferred from timestamps.
+  const startedAt = Date.now();
+  // Named touchMs, not keyMs: the log sanitizer redacts any field whose name
+  // contains "key", which would blank the one number this logging exists for.
+  let pinMs = null;
+  let touchMs = null;
 
   try {
-    // Determine if UV is required (PIN will be needed)
+    // Determine if UV is required (PIN will be needed). A get with no
+    // allowCredentials also needs the PIN: the discoverable flow lists the
+    // key's resident credentials via credential management, which is PIN-gated
+    // on most keys regardless of what userVerification asks for.
     const uvRequired = operation === "create"
       ? options.authenticatorSelection?.userVerification === "required"
       : options.userVerification === "required";
+    const discoverableGet = operation === "get" && (options.allowCredentials?.length ?? 0) === 0;
+
+    // With no key plugged in, discovery used to fail the ceremony outright and
+    // the page showed its own generic error, after the PIN had already been
+    // asked for. Wait for the key under an "insert your security key" prompt
+    // instead, and only then ask for the PIN. One Cancel aborts either prompt.
+    const abortController = new AbortController();
+    // The injected login frame gives up on the request after 120s, so the
+    // wait stops well before that and leaves time for the PIN and the touch.
+    const insertDeadline = Date.now() + 60_000;
+    let insertPrompt = null;
+    try {
+      while ((await fido2Backend.discoverDevices()).length === 0) {
+        if (Date.now() >= insertDeadline) throw new Error(fido2Backend.NO_DEVICE_MESSAGE);
+        insertPrompt ??= showTouchPrompt(() => abortController.abort(), "insert");
+        await sleep(1000, undefined, { signal: abortController.signal });
+      }
+      // A Cancel that lands while discovery itself is running never reaches
+      // the sleep above, so check once more before asking for the PIN.
+      abortController.signal.throwIfAborted();
+    } catch (err) {
+      throw err.name === "AbortError" ? new Error(fido2Backend.CANCELLED_MESSAGE) : err;
+    } finally {
+      insertPrompt?.dismiss();
+    }
 
     let preCollectedPin = null;
-    if (uvRequired) {
-      log.info("[WEBAUTHN] userVerification=required, collecting PIN upfront");
+    if (uvRequired || discoverableGet) {
+      log.info("[WEBAUTHN] Collecting PIN upfront", { uvRequired, discoverableGet });
+      const pinStartedAt = Date.now();
       preCollectedPin = await collectPin(event.sender);
+      pinMs = Date.now() - pinStartedAt;
       log.info("[WEBAUTHN] PIN collected, proceeding with fido2-tools");
     }
 
-    const result = operation === "create"
-      ? await fido2Backend.createCredential({ ...options, origin, preCollectedPin })
-      : await fido2Backend.getAssertion({ ...options, origin, preCollectedPin });
-    log.info("[WEBAUTHN] Succeeded", { op: operation });
-    return { success: true, data: result };
+    // From here the fido2 tool blocks on the user-presence check with no
+    // output of its own, so the prompt spans the whole call and is dismissed
+    // in `finally` on success, failure, cancel, or the backend's 60s timeout.
+    const prompt = showTouchPrompt(() => abortController.abort());
+    const backendOptions = {
+      ...options,
+      origin,
+      topOrigin: senderOrigin,
+      preCollectedPin,
+      abortSignal: abortController.signal,
+    };
+
+    const touchStartedAt = Date.now();
+    try {
+      const result = operation === "create"
+        ? await fido2Backend.createCredential(backendOptions)
+        : await fido2Backend.getAssertion(backendOptions);
+      touchMs = Date.now() - touchStartedAt;
+      log.info("[WEBAUTHN] Succeeded", { op: operation, totalMs: Date.now() - startedAt, pinMs, touchMs });
+      return { success: true, data: result };
+    } catch (err) {
+      touchMs = Date.now() - touchStartedAt;
+      throw err;
+    } finally {
+      prompt.dismiss();
+    }
   } catch (err) {
-    log.error("[WEBAUTHN] Failed", { op: operation, errClass: log.classifyError(err) });
+    const timings = { totalMs: Date.now() - startedAt, pinMs, touchMs };
+    // A cancel is the user's own choice, not a failure of the key.
+    if (err.message === fido2Backend.CANCELLED_MESSAGE) {
+      log.info("[WEBAUTHN] Cancelled by user", { op: operation, ...timings });
+    } else {
+      log.error("[WEBAUTHN] Failed", { op: operation, errClass: log.classifyError(err), ...timings });
+    }
     return { success: false, error: err.message };
   }
+}
+
+/**
+ * Point at auth.webauthn.extraOrigins when a subframe is left without the
+ * override. Opaque origins (about:blank, data:) are not sign-in pages.
+ * @param {string} frameOrigin
+ */
+function logSkippedFrame(frameOrigin) {
+  if (!frameOrigin.startsWith("https://") || skippedOrigins.has(frameOrigin)) return;
+  skippedOrigins.add(frameOrigin);
+  log.info("[WEBAUTHN] Skipped a subframe outside the login allowlist", {
+    hint: "if this is your sign-in page and the security key prompt never appears, add its origin to auth.webauthn.extraOrigins",
+  });
 }
 
 /**
@@ -140,6 +248,7 @@ function injectIntoFrame(wf) {
   }
 
   if (!isAllowedOrigin(frameOrigin)) {
+    logSkippedFrame(frameOrigin);
     return;
   }
 
@@ -165,7 +274,7 @@ function injectIntoFrame(wf) {
         const CHUNK = 8192;
         let bin = "";
         for (let i = 0; i < bytes.length; i += CHUNK) bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-        return btoa(bin).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/, "");
+        return btoa(bin).replaceAll("+", "-").replaceAll("/", "_").replace(/={1,2}$/, "");
       }
 
       function b64urlToBuf(s) {
@@ -173,6 +282,17 @@ function injectIntoFrame(wf) {
         while (b.length % 4) b += "=";
         const d = atob(b);
         return Uint8Array.from(d, c => c.charCodeAt(0)).buffer;
+      }
+
+      function createWithPrototype(prototype, properties) {
+        return Object.create(
+          prototype,
+          Object.getOwnPropertyDescriptors(properties)
+        );
+      }
+
+      function createPublicKeyCredential(properties) {
+        return createWithPrototype(PublicKeyCredential.prototype, properties);
       }
 
       function serCreate(pk) {
@@ -217,11 +337,14 @@ function injectIntoFrame(wf) {
         console.info("[WEBAUTHN:frame] Intercepting credentials.create()");
         const r = await ipcInvoke("webauthn:create", serCreate(opts.publicKey));
         const raw = b64urlToBuf(r.rawId);
-        return { id: r.credentialId, rawId: raw, type: r.type, authenticatorAttachment: "cross-platform",
-          response: { attestationObject: b64urlToBuf(r.attestationObject), clientDataJSON: b64urlToBuf(r.clientDataJson),
+        return createPublicKeyCredential({ id: r.credentialId, rawId: raw, type: r.type, authenticatorAttachment: "cross-platform",
+          response: createWithPrototype(AuthenticatorAttestationResponse.prototype, {
+            attestationObject: b64urlToBuf(r.attestationObject), clientDataJSON: b64urlToBuf(r.clientDataJson),
             getAuthenticatorData: () => b64urlToBuf(r.authenticatorData), getTransports: () => r.transports || ["usb"],
-            getPublicKey: () => null, getPublicKeyAlgorithm: () => r.publicKeyAlgorithm || -7 },
-          getClientExtensionResults: () => ({}) };
+            getPublicKey: () => null, getPublicKeyAlgorithm: () => r.publicKeyAlgorithm || -7 }),
+          getClientExtensionResults: () => ({}),
+          toJSON: () => ({ id: r.credentialId, rawId: r.rawId, type: r.type,
+            response: { attestationObject: r.attestationObject, clientDataJSON: r.clientDataJson } }) });
       };
 
       navigator.credentials.get = async function(opts) {
@@ -230,10 +353,19 @@ function injectIntoFrame(wf) {
         console.info("[WEBAUTHN:frame] Intercepting credentials.get()");
         const r = await ipcInvoke("webauthn:get", serGet(opts.publicKey));
         const raw = b64urlToBuf(r.rawId);
-        return { id: r.credentialId, rawId: raw, type: r.type, authenticatorAttachment: "cross-platform",
-          response: { authenticatorData: b64urlToBuf(r.authenticatorData), clientDataJSON: b64urlToBuf(r.clientDataJson),
-            signature: b64urlToBuf(r.signature), userHandle: r.userHandle ? b64urlToBuf(r.userHandle) : null },
-          getClientExtensionResults: () => ({}) };
+        const authData = b64urlToBuf(r.authenticatorData);
+        // The real response prototype matters: the bridge/fido login page
+        // silently discards assertions failing an instanceof check (#2719).
+        return createPublicKeyCredential({ id: r.credentialId, rawId: raw, type: r.type, authenticatorAttachment: "cross-platform",
+          response: createWithPrototype(AuthenticatorAssertionResponse.prototype, {
+            authenticatorData: authData, clientDataJSON: b64urlToBuf(r.clientDataJson),
+            signature: b64urlToBuf(r.signature), userHandle: r.userHandle ? b64urlToBuf(r.userHandle) : null,
+            getAuthenticatorData: () => authData }),
+          getClientExtensionResults: () => ({}),
+          toJSON: () => ({ id: r.credentialId, rawId: r.rawId, type: r.type,
+            authenticatorAttachment: "cross-platform", clientExtensionResults: {},
+            response: { authenticatorData: r.authenticatorData, clientDataJSON: r.clientDataJson,
+              signature: r.signature, userHandle: r.userHandle || null } }) });
       };
 
       console.info("[WEBAUTHN:frame] navigator.credentials patched in subframe");
@@ -249,11 +381,13 @@ function injectIntoFrame(wf) {
  *
  * @param {Electron.BrowserWindow} [mainWindow] - Main window for frame injection
  * @param {object} [config] - App config; auth.webauthn.debug enables verbose logs
+ *   and auth.webauthn.extraOrigins adds login origins beyond the Microsoft defaults
  */
 async function initialize(mainWindow, config) {
   if (initialized) return;
 
   log.setDebug(config?.auth?.webauthn?.debug);
+  allowedOrigins = buildAllowedOrigins(config?.auth?.webauthn?.extraOrigins);
 
   const available = await fido2Backend.isAvailable();
   if (!available) {
@@ -289,7 +423,18 @@ async function initialize(mainWindow, config) {
   }
 
   initialized = true;
-  log.info("[WEBAUTHN] Hardware security key support initialized");
+  log.info("[WEBAUTHN] Hardware security key support initialized", {
+    extraOrigins: allowedOrigins.size - DEFAULT_ORIGINS.length,
+  });
 }
 
-module.exports = { initialize };
+module.exports = {
+  initialize,
+  // Exported for tests: the allowlist is the security gate, so it is asserted
+  // on directly rather than through a replica.
+  _applyExtraOrigins: (extraOrigins) => {
+    allowedOrigins = buildAllowedOrigins(extraOrigins);
+  },
+  _isAllowedOrigin: isAllowedOrigin,
+  _injectIntoFrame: injectIntoFrame,
+};

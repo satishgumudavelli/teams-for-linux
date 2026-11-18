@@ -2,6 +2,7 @@ import { _electron as electron } from 'playwright';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 // Shared scaffolding for the multi-account E2E specs (and any future
 // flag-toggle test). Keeps the launch/discover/cleanup boilerplate in
@@ -22,6 +23,21 @@ export const PROFILE_IPC_CHANNELS = [
   'profile-update',
   'profile-remove',
 ];
+
+// Switcher pill `ipcMain.on` channels (registered when the flag is on). These
+// live on the EventEmitter, not `_invokeHandlers`, so they need `listenerCount`
+// rather than the `getRegisteredHandlers` probe.
+export const SWITCHER_EVENT_CHANNELS = [
+  'profile-switcher-open-add',
+  'profile-switcher-open-manage',
+];
+
+// Switcher pill `ipcMain.handle` channels (registered when the flag is on),
+// probed via `getRegisteredHandlers` like the `profile-*` channels.
+export const SWITCHER_HANDLE_CHANNELS = ['profile-switcher-set-expanded'];
+
+// Mirrors SWITCHER_PILL_SIZE in app/mainAppWindow/profileViewManager.js.
+export const SWITCHER_PILL_SIZE = 56;
 
 /**
  * Launch the app with an isolated userData dir and the supplied config.
@@ -112,6 +128,90 @@ export async function getRegisteredHandlers(electronApp, channels) {
     channels
   );
 }
+
+/**
+ * Probe `ipcMain.listenerCount` for the supplied `ipcMain.on` channels.
+ * Returns `{ [channel]: number }`.
+ */
+export async function getEventHandlerCounts(electronApp, channels) {
+  return await electronApp.evaluate(
+    ({ ipcMain }, channelList) =>
+      Object.fromEntries(
+        channelList.map((c) => [c, ipcMain.listenerCount(c)])
+      ),
+    channels
+  );
+}
+
+/**
+ * Inspect the main window's `contentView` children (the profile views + the
+ * switcher chrome strip). Returns `{ count, bounds }` where `bounds` is the
+ * array of each child's `getBounds()` in z-order (last = topmost), or
+ * `{ error }` if the main window can't be found.
+ */
+export async function getContentViewChildBounds(electronApp) {
+  return await electronApp.evaluate(({ BrowserWindow }) => {
+    const hosts = new Set([
+      'teams.cloud.microsoft',
+      'teams.microsoft.com',
+      'teams.live.com',
+      'login.microsoftonline.com',
+    ]);
+    const isMain = (w) => {
+      try {
+        return hosts.has(new URL(w.webContents.getURL()).hostname);
+      } catch {
+        return false;
+      }
+    };
+    const all = BrowserWindow.getAllWindows();
+    const win = all.find(isMain) || all[0];
+    if (!win) return { error: 'no main window' };
+    const children = win.contentView.children || [];
+    const [contentWidth, contentHeight] = win.getContentSize();
+    return {
+      count: children.length,
+      contentWidth,
+      contentHeight,
+      bounds: children.map((c) => c.getBounds()),
+      visible: children.map((c) => c.getVisible()),
+      urls: children.map((c) => {
+        try {
+          return c.webContents ? c.webContents.getURL() : null;
+        } catch {
+          return null;
+        }
+      }),
+    };
+  });
+}
+
+/**
+ * Invoke an `ipcMain.handle` channel's handler directly (bypassing a
+ * renderer) for tests. Returns `{ result }` or `{ error }`.
+ */
+export async function invokeHandler(electronApp, channel, args = []) {
+  return await electronApp.evaluate(
+    ({ ipcMain }, { channel, args, senderUrl }) => {
+      const handler = ipcMain._invokeHandlers?.get?.(channel);
+      if (!handler) return { error: `${channel} handler missing` };
+      return Promise.resolve(
+        handler({ senderFrame: { url: senderUrl } }, ...args)
+      ).then((result) => ({
+        result,
+      }));
+    },
+    { channel, args, senderUrl: APP_PAGE_URL }
+  );
+}
+
+// Pinned channels (profile-*, Graph) accept only the app's own pages, so a
+// direct handler call poses as the profile switcher pill, their real caller.
+// Resolved from the working directory like the `./app/index.js` launch path:
+// Playwright compiles these helpers to CommonJS, so import.meta is unavailable.
+export const APP_PAGE_URL = pathToFileURL(
+  join(process.cwd(), 'app', 'profileSwitcher', 'switcher.html')
+).href;
 
 /**
  * Best-effort shutdown of the electronApp + temp userData dir. Mirrors

@@ -14,6 +14,8 @@ require.cache[require.resolve('electron')] = {
 };
 
 const MQTTMediaStatusService = require('../../app/mqtt/mediaStatusService');
+const { applyObjectDefaults } = require('../../app/config/mergeDefaults');
+const options = require('../../app/config/options');
 
 // ---- Test helpers -----------------------------------------------------------
 
@@ -71,6 +73,111 @@ describe('MQTTMediaStatusService', () => {
 		};
 		mockApp.removeAllListeners();
 		mockIpcMain.removeAllListeners();
+	});
+
+	describe('Incoming call caller (#3019)', () => {
+		const callerEnabled = { incomingCallCaller: { enabled: true } };
+
+		it('publishes no caller unless enabled', async () => {
+			createService(mqttClient);
+			mockApp.emit('teams-incoming-call-started', { name: 'Pat Example', number: '+1 555-010-0001' });
+			await flush();
+			assert.deepStrictEqual(published, [
+				{ topic: 'teams/incoming-call', payload: 'true', opts: { retain: true } },
+			]);
+		});
+
+		it('is off after config loading when not set', async () => {
+			const config = { mqtt: { topicPrefix: 'teams' } };
+			applyObjectDefaults(config, options);
+			assert.strictEqual(config.mqtt.incomingCallCaller.enabled, false);
+			new MQTTMediaStatusService(mqttClient, config).initialize();
+			mockApp.emit('teams-incoming-call-started', { name: 'Pat Example' });
+			await flush();
+			assert.ok(!published.some((p) => p.topic.endsWith('/caller')));
+		});
+
+		it('publishes the caller before incoming-call goes true', async () => {
+			createService(mqttClient, callerEnabled);
+			mockApp.emit('teams-incoming-call-started', {
+				scenario: 'incoming_pstn_call',
+				number: '+1 555-010-0001',
+				name: 'Pat Example',
+				contact: true,
+				callId: 'call-1',
+			});
+			await flush();
+			assert.deepStrictEqual(published.map((p) => p.topic), [
+				'teams/incoming-call/caller',
+				'teams/incoming-call',
+			]);
+			const { timestamp, ...caller } = JSON.parse(published[0].payload);
+			assert.deepStrictEqual(caller, {
+				scenario: 'incoming_pstn_call',
+				number: '+1 555-010-0001',
+				name: 'Pat Example',
+				contact: true,
+				callId: 'call-1',
+			});
+			assert.strictEqual(new Date(timestamp).toISOString(), timestamp);
+			assert.deepStrictEqual(published[0].opts, { retain: false, redactLog: true });
+			assert.strictEqual(published[1].payload, 'true');
+		});
+
+		it('publishes only the known fields', async () => {
+			createService(mqttClient, callerEnabled);
+			mockApp.emit('teams-incoming-call-started', {
+				name: 'Pat Example',
+				image: 'data:image/jpeg;base64,AAAA',
+				queue: null,
+			});
+			await flush();
+			const caller = JSON.parse(published[0].payload);
+			delete caller.timestamp;
+			assert.deepStrictEqual(caller, { name: 'Pat Example' });
+		});
+
+		it('carries the MQTT clientId, as the status topic does', async () => {
+			createService(mqttClient, { ...callerEnabled, clientId: 'teams-for-linux' });
+			mockApp.emit('teams-incoming-call-started', { name: 'Pat Example' });
+			await flush();
+			assert.strictEqual(JSON.parse(published[0].payload).clientId, 'teams-for-linux');
+		});
+
+		it('publishes only a timestamp when there are no details', async () => {
+			createService(mqttClient, callerEnabled);
+			mockApp.emit('teams-incoming-call-started');
+			await flush();
+			assert.deepStrictEqual(Object.keys(JSON.parse(published[0].payload)), ['timestamp']);
+		});
+
+		it('leaves the caller topic alone when the call stops ringing', async () => {
+			// The caller is never retained, so there is nothing to clear.
+			createService(mqttClient, callerEnabled);
+			mockApp.emit('teams-incoming-call-ended');
+			await flush();
+			assert.deepStrictEqual(published, [
+				{ topic: 'teams/incoming-call', payload: 'false', opts: { retain: true } },
+			]);
+		});
+
+		it('follows a customised incomingCall topic', async () => {
+			createService(mqttClient, { ...callerEnabled, mediaTopics: { incomingCall: 'ringing' } });
+			mockApp.emit('teams-incoming-call-started');
+			await flush();
+			assert.ok(published.some((p) => p.topic === 'teams/ringing/caller'));
+		});
+
+		it('follows a customised incomingCall topic through config loading', async () => {
+			// Config loading deep-merges the option defaults into the user's
+			// mediaTopics; a literal caller default there would pin the topic.
+			const config = { mqtt: { topicPrefix: 'teams', ...callerEnabled, mediaTopics: { incomingCall: 'ringing' } } };
+			applyObjectDefaults(config, options);
+			new MQTTMediaStatusService(mqttClient, config).initialize();
+			mockApp.emit('teams-incoming-call-started');
+			await flush();
+			assert.ok(published.some((p) => p.topic === 'teams/ringing/caller'));
+		});
 	});
 
 	describe('Default topic names (backward compatibility)', () => {
@@ -177,6 +284,105 @@ describe('MQTTMediaStatusService', () => {
 			mockIpcMain.emit('microphone-state-changed', undefined, 'muted');
 			await flush();
 			assert.strictEqual(emittedControlState, 'muted', 'should emit control state event');
+		});
+	});
+
+	describe('Meeting-started pulse (#2587)', () => {
+		// All tests use a tiny resetSeconds (and wait the pulse out before
+		// finishing) so no pending reset timer leaks a publish into a later
+		// test or keeps the node:test process alive.
+		const waitForPulseReset = () => new Promise((r) => setTimeout(r, 120));
+
+		it('publishes true to meeting-started topic on meeting-started IPC', async () => {
+			createService(mqttClient, { meetingStartDetection: { resetSeconds: 0.05 } });
+			mockIpcMain.emit('meeting-started');
+			await flush();
+			assertPublished(published, 'teams/meeting-started', 'true', { retain: true });
+			await waitForPulseReset();
+		});
+
+		it('auto-resets to false after resetSeconds', async () => {
+			createService(mqttClient, { meetingStartDetection: { resetSeconds: 0.05 } });
+			mockIpcMain.emit('meeting-started');
+			await flush();
+			assertPublished(published, 'teams/meeting-started', 'true');
+
+			await waitForPulseReset();
+			const resets = published.filter(
+				(p) => p.topic === 'teams/meeting-started' && p.payload === 'false'
+			);
+			assert.strictEqual(resets.length, 1, 'pulse should reset to false once');
+		});
+
+		it('resets to false as soon as the call is joined, before resetSeconds', async () => {
+			// Long reset so a pass cannot come from the timer firing (#2587).
+			createService(mqttClient, { meetingStartDetection: { resetSeconds: 60 } });
+			mockIpcMain.emit('meeting-started');
+			await flush();
+			assertPublished(published, 'teams/meeting-started', 'true');
+
+			mockApp.emit('teams-call-connected');
+			await flush();
+			const resets = published.filter(
+				(p) => p.topic === 'teams/meeting-started' && p.payload === 'false'
+			);
+			assert.strictEqual(resets.length, 1, 'joining should drop the flag once');
+		});
+
+		it('still drops the flag when the join lands mid-publish', async () => {
+			// The 'true' publish is awaited. If the reset were armed only after
+			// that await, a join arriving inside it would find no timer to
+			// cancel and leave the retained topic stuck at 'true' for good.
+			let releaseFirstPublish;
+			const gate = new Promise((r) => { releaseFirstPublish = r; });
+			let first = true;
+			const slowClient = {
+				publish: async (topic, payload, opts) => {
+					if (first && topic === 'teams/meeting-started') {
+						first = false;
+						await gate;
+					}
+					published.push({ topic, payload, opts });
+				},
+			};
+			createService(slowClient, { meetingStartDetection: { resetSeconds: 60 } });
+
+			mockIpcMain.emit('meeting-started');
+			await flush();
+			mockApp.emit('teams-call-connected'); // arrives while 'true' is in flight
+			await flush();
+			releaseFirstPublish();
+			await flush();
+			await flush();
+
+			// Assert a reset was published at all. Arming the timer late means
+			// the join finds nothing to cancel and no 'false' is ever sent.
+			// (Order is not asserted: this mock records on completion, whereas
+			// mqtt.js writes in call order, so the gated 'true' lands last here
+			// but first on the wire.)
+			const resets = published.filter(
+				(p) => p.topic === 'teams/meeting-started' && p.payload === 'false'
+			);
+			assert.strictEqual(resets.length, 1, 'join must still drop the flag');
+		});
+
+		it('does not publish a spurious false when joining without a meeting start', async () => {
+			createService(mqttClient, { meetingStartDetection: { resetSeconds: 60 } });
+			mockApp.emit('teams-call-connected');
+			await flush();
+			const any = published.filter((p) => p.topic === 'teams/meeting-started');
+			assert.strictEqual(any.length, 0, 'no meeting-started traffic without a start');
+		});
+
+		it('uses custom mediaTopics for meetingStarted', async () => {
+			createService(mqttClient, {
+				mediaTopics: { meetingStarted: 'meeting-live' },
+				meetingStartDetection: { resetSeconds: 0.05 },
+			});
+			mockIpcMain.emit('meeting-started');
+			await flush();
+			assertPublished(published, 'teams/meeting-live', 'true');
+			await waitForPulseReset();
 		});
 	});
 

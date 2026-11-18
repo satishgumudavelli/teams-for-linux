@@ -6,7 +6,9 @@ id: 020-multi-account-profile-switcher
 
 ## Status
 
-✅ Proposed
+✅ Implemented (Phase 1, v2.9.0 onwards)
+
+Phase 1 landed incrementally starting in v2.9.0: the `multiAccount.enabled` flag and Intune mutex ([#2450](https://github.com/IsmaelMartinez/teams-for-linux/pull/2450)), the add-profile dialog with first-run bootstrap ([#2496](https://github.com/IsmaelMartinez/teams-for-linux/pull/2496)), the manage-profiles dialog with rename and remove ([#2510](https://github.com/IsmaelMartinez/teams-for-linux/pull/2510)), and the Profiles menu ([#2489](https://github.com/IsmaelMartinez/teams-for-linux/pull/2489)), followed by the switcher pill ([#2661](https://github.com/IsmaelMartinez/teams-for-linux/pull/2661)) in v2.14.0 and the `Ctrl+Alt+1…5` pinned-profile shortcuts ([#2787](https://github.com/IsmaelMartinez/teams-for-linux/pull/2787)) in v2.16.0. Phase 2 has started with the sender-to-profile attribution map ([#2865](https://github.com/IsmaelMartinez/teams-for-linux/pull/2865), v2.19.0), descendant attribution plus a window-open policy for profile views ([#2916](https://github.com/IsmaelMartinez/teams-for-linux/pull/2916)), and per-profile unread aggregation with the summed tray badge ([#2980](https://github.com/IsmaelMartinez/teams-for-linux/pull/2980)). Phase 3 is untouched. Both remaining phases are tracked in [#2495](https://github.com/IsmaelMartinez/teams-for-linux/issues/2495), and [#2947](https://github.com/IsmaelMartinez/teams-for-linux/issues/2947) is an open Phase 1 bug where the secondary profile view is not resized after maximize/restore on XWayland.
 
 ## Context
 
@@ -34,7 +36,7 @@ The `BrowserView` API has since been superseded by `WebContentsView` (Electron 3
 
 - **Feature-flag gated.** The entire feature is opt-in via `multiAccount.enabled` in `config.json` (default `false`). When disabled, behavior is byte-identical to pre-feature single-profile operation. See § "Feature Flag & Scope" for the full contract.
 - Each profile is bound to `session.fromPartition('persist:teams-profile-{uuid}')`; the partition UUID is generated once at profile creation (`crypto.randomUUID()`) and is immutable for the view's lifetime. The `persist:` prefix is what tells Electron to persist cookies and storage for that partition — the method's optional `options` second argument is not needed for this persistence behavior.
-- All profile views are instantiated up front as children of `mainWindow.contentView`. Switching toggles visibility via `contentView.addChildView` / `removeChildView` and bounds updates — **no `loadURL` on switch**, so sessions stay warm, drafts survive, and the Teams websocket is not reconnected.
+- All profile views are instantiated up front as children of `mainWindow.contentView`. Switching toggles visibility via `view.setVisible()` and bounds updates, with `addChildView` only reordering (views are never detached on switch, see #3057) — **no `loadURL` on switch**, so sessions stay warm, drafts survive, and the Teams websocket is not reconnected.
 - Profile metadata is stored under `app.profiles` in the existing `settingsStore` (electron-store), not in user-facing `config.json`. When the feature flag is flipped on for the first time, the legacy `persist:teams-4-linux` session becomes Profile 0 ("My account") with no login loss.
 
 ### Rationale
@@ -95,9 +97,9 @@ In Phase 1, only four fields live on each `Profile` record in `settingsStore`; e
 
 | Field | Type | Purpose |
 |-------|------|---------|
-| `disableNotifications` | boolean | Silence this profile's notification badges and OS toasts (Phase 2 plumbing) |
-| `muted` | boolean | Suppress audio cues from this profile (notification sounds, incoming-call ring) |
-| `pinned` | boolean | Assigns a `Ctrl+Shift+N` keyboard shortcut; up to 5 pinned profiles |
+| `disableNotifications` | boolean | Silence this profile's OS toasts. Its unread still counts toward the tray badge and the switcher pill: the switch means "don't interrupt me", not "hide that anything happened" |
+| `muted` | boolean | Suppress this profile's notification sounds. The incoming-call ring is Teams' own page audio and is not covered yet |
+| `pinned` | boolean | Assigns a `Ctrl+Alt+N` keyboard shortcut; up to 5 pinned profiles |
 | `url` | string, optional | Per-profile URL override for GovCloud (`https://gov.teams.microsoft.us/`) or dev endpoints; falls back to the global `url` config |
 
 **Shared across all profiles (from `config.json` / CLI switches):**
@@ -119,7 +121,7 @@ On the first launch **after** `multiAccount.enabled` is flipped to `true`, if `a
 - `avatarColor`: deterministically derived from a hash of the partition string
 - `avatarInitials`: "MA" (editable later)
 
-The user sees exactly the same Teams view they had before the flag flipped. The switcher UI appears in the title bar, but with one entry. No re-login required.
+The user sees exactly the same Teams view they had before the flag flipped. The switcher pill shows the one migrated profile. No re-login required.
 
 ### Add a profile
 
@@ -134,11 +136,25 @@ The user sees exactly the same Teams view they had before the flag flipped. The 
 
 ### Switch between profiles
 
-**Mouse:** top-right dropdown in the title bar showing the active profile's initials/avatar. Clicking opens a compact picker listing all profiles (active one highlighted). Clicking a profile switches to it.
+> **Erratum (Phase 1c.2 implementation):** the "title bar" wording below is
+> superseded. The switcher ships as a small avatar **pill in the bottom-left
+> corner** — a `WebContentsView` overlay in `mainWindow.contentView`
+> (`app/profileSwitcher/`), not a native title bar. A native title-bar button
+> isn't possible on Linux (with the native frame the window controls are
+> WM-drawn; going frameless to draw them ourselves is a CSD/SSD minefield,
+> ruled out). A full-width top strip was tried first but covered Teams' own top
+> chrome (global search, back/forward, account menu) on the root profile
+> (#2661); Teams' bottom-left rail is empty, so the pill lives there and covers
+> nothing. Profile views are **not** inset (the pill is a small corner overlay),
+> so Profile 0 stays on the root window's `webContents` with no special
+> handling. The dropdown picker UX — active highlighted, click to switch — is
+> unchanged; it opens upward from the pill.
 
-**Keyboard:** `Ctrl+Shift+1…5` jumps directly to pinned profile N (mirrors the Windows native Teams client). Up to 5 pinned profiles supported; pinned state is the per-profile `pinned` boolean.
+**Mouse:** a bottom-left avatar pill; clicking opens a compact picker (opening upward) listing all profiles (active one highlighted). Clicking a profile switches to it.
 
-**Mechanism:** switching toggles visibility via `mainWindow.contentView.addChildView` / `removeChildView` and bounds updates. **No `loadURL`** — the switched-away view stays in the view hierarchy but hidden. Sessions stay warm, drafts survive, the Teams websocket is not reconnected. Target: under 500 ms switch latency (verified by E2E timing assertion).
+**Keyboard:** `Ctrl+Alt+1…5` jumps directly to pinned profile N. Up to 5 pinned profiles supported; pinned state is the per-profile `pinned` boolean. (Originally specced as `Ctrl+Shift+1…5` to mirror the native Windows client, but the Teams *web* client this app wraps binds `Ctrl+Shift+<digit>` for its own app-bar navigation — the switch chord moved to the unbound `Ctrl+Alt` namespace, as community testing on #2495 also suggested. Implemented as window-menu accelerators, so they fire only while the app is focused and are unavailable on macOS, which has no per-window menu.)
+
+**Mechanism:** every profile view is attached to `mainWindow.contentView` when created and switching toggles `view.setVisible()` plus bounds updates, using `addChildView` only to raise the active view. Detaching with `removeChildView` and attaching later is avoided: on Linux, from Electron 42.11 and 43, a view that loaded Teams while detached paints but never receives input once attached (#3057). **No `loadURL`** — the switched-away view stays in the view hierarchy but hidden. Sessions stay warm, drafts survive, the Teams websocket is not reconnected. Target: under 500 ms switch latency (verified by E2E timing assertion).
 
 ### Rename a profile
 
@@ -146,7 +162,7 @@ The user sees exactly the same Teams view they had before the flag flipped. The 
 2. Click a profile's name to enter inline-edit mode — the static text is replaced by an `<input>` pre-filled with the current name and selected.
 3. **Enter** or blur saves; **Esc** cancels and reverts to the prior name.
 4. Validation matches Add-profile: trimmed name must be non-empty (also enforced server-side in `ProfilesManager.update`'s `#applyName`). Empty input shows an inline error and the input keeps focus until corrected or cancelled.
-5. On save the renderer sends `manage-profile-rename` (an `ipcMain.handle` channel owned by the dialog), and the dialog forwards to `ProfilesManager.update(id, { name })` server-side; `ProfilesManager` emits `update`; the menu's Switch-to submenu and the title-bar switcher rebuild automatically. Renaming has no session impact — no re-login, no view reload.
+5. On save the renderer sends `manage-profile-rename` (an `ipcMain.handle` channel owned by the dialog), and the dialog forwards to `ProfilesManager.update(id, { name })` server-side; `ProfilesManager` emits `update`; the menu's Switch-to submenu and the switcher pill rebuild automatically. Renaming has no session impact — no re-login, no view reload.
 
 ### Remove a profile
 
@@ -295,17 +311,20 @@ Several module-level singletons today assume a single account. Each must be scop
 | `app/login/index.js` (`isFirstLoginTry`, module-level `let`) | Switching profile mid-login produces a false "already logged in" state; the second profile's first 401 is mistaken for a retry and triggers an app relaunch |
 | `app/mainAppWindow/index.js` (screen-preview window partition `persist:teams-for-linux-session`) | **Resolved / moot since #2534.** Originally flagged as a cross-profile leak (a preview opened from profile A showing profile A's session even when profile B started the share). After the #2534 rework the preview window no longer loads Teams or re-captures the screen — it paints `ImageBitmap` snapshots forwarded over a `MessagePort` from the active profile's renderer — so it carries no Teams session and its partition string is inert. No code change needed. |
 | `app/mainAppWindow/index.js` (`setDisplayMediaRequestHandler` registered on the root window's session only) | Profile views running against `persist:teams-profile-{uuid}` get no in-app picker — share-screen requests fall through to a silent no-op on Linux or the OS-native picker on macOS, bypassing preview, lock inhibition, and source-selection wiring (#2529) |
+| `app/mainAppWindow/index.js` (`injectScreenSharingLogic` executed on the root window's webContents only) | **Resolved (#2979).** The injected screen-sharing script (audio stripping on `getDisplayMedia`, preview snapshot relay, stop-button monitoring) never ran in profile views, so a share from a second profile kept Teams' raw audio constraint — the #1800 echo re-entered through the profile views — and produced no preview. `ProfileViewManager` now runs the same injection on each profile view's `did-finish-load`, and the `screen-sharing-started` handler posts the preview `MessagePort` to the IPC sender rather than the root window, so the preview paints for whichever profile started the share. |
 | `app/mainAppWindow/index.js` (`cleanExpiredAuthCookies` called once at startup against a single partition) | Other profiles' expired auth cookies are never cleaned; only the startup-active profile benefits |
 | Call state + power-save blocker (`app/mainAppWindow/browserWindowManager.js:237-259`) | Blocker outlives the profile that started the call — switching away from an in-call profile leaves the OS pinned awake under the new profile |
 | Incoming call toast (`app/incomingCallToast/index.js`) | Toast raised from profile A can be dismissed (or answered) by profile B, because the toast has no notion of which partition produced it |
+| `app/menus/index.js` (`quit(clearStorage)` resolved one session from `startupConfig.partition`) | **Resolved in #2862.** "Quit (Clear Storage)" left every profile's cookies and tokens on disk, so the menu item did not do what its confirmation dialog promised. Now enumerates profiles through `profilesManager` and clears each partition, deduped because Profile 0 reuses the legacy one |
+| `app/mainAppWindow/browserWindowManager.js` (startup clear resolved one session from `config.partition`) | **Resolved in #2866.** Same single-partition shape as the quit-time clear, so a configured `storage.clearData` left every profile's cookies and tokens on disk at launch. Both paths now share `app/utils/storagePartitions.js`, which collects the partitions and clears them without rejecting |
 
 Phase 1 migrates the first entry (`isFirstLoginTry` → per-`webContents` `WeakMap`, landed) and the third (`setDisplayMediaRequestHandler` rebound per profile session — discovered post-MVP and shipped via #2529/#2533). The second entry (screen-preview partition) turned out to need no migration: the #2534 preview rework removed the session it would otherwise have leaked (see the audit note above). Phases 2–3 address the remaining three as their corresponding features (aggregated unread, cross-profile call handling) come online.
 
 ## Phased Delivery
 
-- **Phase 1 — MVP:** new `multiAccount.enabled` config flag (default `false`) with startup-time mutual-exclusion check against `auth.intune.enabled`, per-profile `WebContentsView`s, top-right dropdown switcher, `Profiles` menu bar entry with Add / Switch / Manage flows, `Ctrl+Shift+1…5` keyboard shortcuts for pinned profiles, first-run Profile 0 migration (gated on flag flip), the six Phase 1 `profile-*` IPC channels, migration of the relevant shared-state items from the audit above (the `isFirstLoginTry` → per-`webContents` `WeakMap` conversion in `app/login/index.js`, and rebinding `setDisplayMediaRequestHandler` on each profile session — discovered post-MVP and shipped via #2529/#2533; the screen-preview partition entry needed no change after the #2534 preview rework), a small refactor of `CustomBackground` so `customBGServiceUrl` lives on a private instance field rather than at module scope, and an E2E smoke test covering the byte-identical-when-disabled regression case. The remaining three audit entries (`cleanExpiredAuthCookies`, power-save blocker, incoming-call toast) defer to Phases 2–3 as their corresponding features (aggregated unread, cross-profile call handling) come online.
+- **Phase 1 — MVP:** new `multiAccount.enabled` config flag (default `false`) with startup-time mutual-exclusion check against `auth.intune.enabled`, per-profile `WebContentsView`s, bottom-left switcher pill, `Profiles` menu bar entry with Add / Switch / Manage flows, `Ctrl+Alt+1…5` keyboard shortcuts for pinned profiles, first-run Profile 0 migration (gated on flag flip), the six Phase 1 `profile-*` IPC channels, migration of the relevant shared-state items from the audit above (the `isFirstLoginTry` → per-`webContents` `WeakMap` conversion in `app/login/index.js`, and rebinding `setDisplayMediaRequestHandler` on each profile session — discovered post-MVP and shipped via #2529/#2533; the screen-preview partition entry needed no change after the #2534 preview rework), a small refactor of `CustomBackground` so `customBGServiceUrl` lives on a private instance field rather than at module scope, and an E2E smoke test covering the byte-identical-when-disabled regression case. The remaining three audit entries (`cleanExpiredAuthCookies`, power-save blocker, incoming-call toast) defer to Phases 2–3 as their corresponding features (aggregated unread, cross-profile call handling) come online.
 - **Phase 2 — Background notifications:** per-partition preload notification shim and unread-count tagging, aggregated tray badge, per-profile unread dots, `disableNotifications` and `muted` plumbing.
-- **Phase 3 — Power features:** `--profile-id` CLI flag end-to-end, keyboard shortcut to cycle profiles, pinned-profile sidebar (max 5, exposing the `Ctrl+Shift+1…5` shortcuts introduced in Phase 1), drag-to-reorder.
+- **Phase 3 — Power features:** `--profile-id` CLI flag end-to-end, keyboard shortcut to cycle profiles, pinned-profile sidebar (max 5, exposing the `Ctrl+Alt+1…5` shortcuts introduced in Phase 1), drag-to-reorder.
 
 ## Related
 
@@ -315,7 +334,7 @@ Phase 1 migrates the first entry (`isFirstLoginTry` → per-`webContents` `WeakM
   - `app/config/defaults.js` — add the `multiAccount.enabled` default (`false`) plus any sub-keys (currently none)
   - `app/index.js` — startup-time mutual-exclusion check between `auth.intune.enabled` and `multiAccount.enabled`, plus ProfilesManager wiring (already landed on `feat/multi-account-profiles`)
   - `app/mainAppWindow/browserWindowManager.js` — `WebContentsView` creation and bounds/visibility management; gated on `multiAccount.enabled`
-  - `app/partitions/manager.js` — extend (or sibling as `app/profiles/manager.js`) for profile CRUD + partition derivation
+  - `app/partitions/manager.js` — extend (or sibling as `app/profiles/manager.js`) for profile CRUD + partition derivation (landed as `app/profilesManager/index.js`)
   - `app/security/ipcValidator.js` — allowlist the six Phase 1 `profile-*` channels (and later-phase additions as they land)
   - `app/login/index.js` — migrate module-level `isFirstLoginTry` to a per-`webContents` `WeakMap` (landed)
   - `app/mainAppWindow/index.js` — extend `exports.onAppSecondInstance` (where `processArgs` already runs) to parse `--profile-id` and switch before loading the URL (Phase 3)

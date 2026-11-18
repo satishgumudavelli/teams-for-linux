@@ -1,3 +1,5 @@
+"use strict";
+
 // app/browser/tools/webauthnOverride.js
 
 /**
@@ -9,6 +11,11 @@
  *
  * Linux-only: on macOS/Windows, Electron's Chromium handles WebAuthn natively.
  */
+
+// Same allowlist the main process enforces, built from the same config, so a
+// ceremony relayed out of a login iframe is not blocked here after the main
+// process would have allowed it (#2931).
+const { buildAllowedOrigins } = require("../../webauthn/originAllowlist");
 
 function init(config, ipcRenderer) {
   if (process.platform !== "linux") {
@@ -78,37 +85,57 @@ function init(config, ipcRenderer) {
 
     console.info("[WEBAUTHN] Intercepting credentials.get()");
 
+    // Observe only, never act on it. Knowing whether the page gives up on a
+    // ceremony (and after how long) is what separates "the user was slow to
+    // touch the key" from "the sign-in failed for an unrelated reason". See
+    // #2719. Wiring the signal through to cancel the call is a behaviour change
+    // and belongs with the touch-prompt work, not here.
+    const startedAt = Date.now();
+    let onAbort = null;
+    if (!options.signal) {
+      console.info("[WEBAUTHN] credentials.get() called without an AbortSignal");
+    } else if (options.signal.aborted) {
+      console.info("[WEBAUTHN] credentials.get() called with an already-aborted signal");
+    } else {
+      onAbort = () => console.info("[WEBAUTHN] Page aborted credentials.get()", { elapsedMs: Date.now() - startedAt });
+      options.signal.addEventListener("abort", onAbort, { once: true });
+    }
+
     try {
       const serialized = serializeGetOptions(options.publicKey);
       const result = await ipcRenderer.invoke("webauthn:get", serialized);
 
       if (!result.success) {
-        console.error("[WEBAUTHN] credentials.get() failed:", result.error);
+        console.error("[WEBAUTHN] credentials.get() failed:", result.error, { elapsedMs: Date.now() - startedAt });
         throw mapError(result.error);
       }
 
-      console.info("[WEBAUTHN] credentials.get() succeeded");
+      console.info("[WEBAUTHN] credentials.get() succeeded", {
+        elapsedMs: Date.now() - startedAt,
+        aborted: options.signal?.aborted ?? false,
+      });
       return reconstructGetResponse(result.data);
     } catch (err) {
-      console.error("[WEBAUTHN] credentials.get() error:", err.message);
+      console.error("[WEBAUTHN] credentials.get() error:", err.message, { elapsedMs: Date.now() - startedAt });
       if (err instanceof DOMException) throw err;
       throw new DOMException(err.message, "NotAllowedError");
+    } finally {
+      // Scope the listener to the call. Left attached it outlives the ceremony
+      // and would log a stale "Page aborted" if the page aborts the signal
+      // afterwards for unrelated reasons.
+      if (onAbort) options.signal.removeEventListener("abort", onAbort);
     }
   };
 
   // Layer 2 relay: listen for postMessage from subframes that were injected
   // via executeJavaScript in the main process. This bridges the gap between
   // frames (no ipcRenderer) and the main process (needs IPC).
-  const ALLOWED_RELAY_ORIGINS = new Set([
-    "https://login.microsoftonline.com",
-    "https://login.microsoft.com",
-    "https://login.live.com",
-  ]);
+  const ALLOWED_RELAY_ORIGINS = buildAllowedOrigins(config?.auth?.webauthn?.extraOrigins);
 
   window.addEventListener("message", async (event) => {
     if (event.data?.type !== "webauthn-request") return;
     if (!ALLOWED_RELAY_ORIGINS.has(event.origin)) {
-      console.warn("[WEBAUTHN] Blocked relay: origin not allowed");
+      console.warn("[WEBAUTHN] Blocked relay: origin not allowed. If this is your federated IdP sign-in page, add it to auth.webauthn.extraOrigins.");
       return;
     }
     const { id, channel, data } = event.data;
@@ -118,7 +145,11 @@ function init(config, ipcRenderer) {
     }
     console.info("[WEBAUTHN] Relaying subframe request", { channel });
     try {
-      const result = await ipcRenderer.invoke(channel, data);
+      // event.origin is set by the browser, not by the frame, so it is the one
+      // trustworthy record of which origin the ceremony belongs to. The main
+      // process signs it instead of our own (outer) origin, and re-checks it
+      // against the allowlist. See #2828.
+      const result = await ipcRenderer.invoke(channel, { ...data, frameOrigin: event.origin });
       if (result.success) {
         event.source.postMessage({ type: "webauthn-response", id, result: result.data }, event.origin);
       } else {
@@ -150,7 +181,8 @@ function bufferToBase64url(buffer) {
   return btoa(binary)
     .replaceAll("+", "-")
     .replaceAll("/", "_")
-    .replace(/=+$/, "");
+    // Bounded: base64 padding is never more than two "=" (S8786).
+    .replace(/={1,2}$/, "");
 }
 
 /**
@@ -201,25 +233,39 @@ function serializeGetOptions(publicKey) {
 }
 
 /**
- * Reconstruct a PublicKeyCredential-shaped object from IPC response.
- * We cannot create real PublicKeyCredential instances, but the shape
- * is sufficient for login.microsoftonline.com's JavaScript to process.
+ * The native PublicKeyCredential constructor cannot be called directly. Start
+ * with its prototype so instanceof checks pass, then add the response fields as
+ * properties of the new object.
  */
+function createWithPrototype(prototype, properties) {
+  return Object.create(
+    prototype,
+    Object.getOwnPropertyDescriptors(properties),
+  );
+}
+
+function createPublicKeyCredential(properties) {
+  return createWithPrototype(PublicKeyCredential.prototype, properties);
+}
+
 function reconstructCreateResponse(data) {
   const rawId = base64urlToBuffer(data.rawId);
-  return {
+  return createPublicKeyCredential({
     id: data.credentialId,
     rawId: rawId,
     type: data.type,
     authenticatorAttachment: "cross-platform",
-    response: {
+    // The response needs its real prototype too: Microsoft's bridge/fido
+    // login page silently discards credentials whose response fails an
+    // AuthenticatorResponse instanceof check (#2719).
+    response: createWithPrototype(AuthenticatorAttestationResponse.prototype, {
       attestationObject: base64urlToBuffer(data.attestationObject),
       clientDataJSON: base64urlToBuffer(data.clientDataJson),
       getAuthenticatorData: () => base64urlToBuffer(data.authenticatorData),
       getTransports: () => data.transports || ["usb"],
       getPublicKey: () => null,
       getPublicKeyAlgorithm: () => data.publicKeyAlgorithm || -7,
-    },
+    }),
     getClientExtensionResults: () => ({}),
     toJSON: () => ({
       id: data.credentialId,
@@ -230,7 +276,7 @@ function reconstructCreateResponse(data) {
         clientDataJSON: data.clientDataJson,
       },
     }),
-  };
+  });
 }
 
 function reconstructGetResponse(data) {
@@ -240,16 +286,20 @@ function reconstructGetResponse(data) {
   const sigBuf = base64urlToBuffer(data.signature);
   const userHandleBuf = data.userHandle ? base64urlToBuffer(data.userHandle) : null;
 
-  const response = {
+  // Grafting the real prototype matters beyond duck typing: Microsoft's
+  // bridge/fido login page (remembered-account sign-in) silently discards
+  // credentials whose response fails an AuthenticatorAssertionResponse
+  // instanceof check, with no error and no network follow-up (#2719).
+  const response = createWithPrototype(AuthenticatorAssertionResponse.prototype, {
     authenticatorData: authDataBuf,
     clientDataJSON: clientDataBuf,
     signature: sigBuf,
     userHandle: userHandleBuf,
     // Some implementations check for these methods on AuthenticatorAssertionResponse
     getAuthenticatorData: () => authDataBuf,
-  };
+  });
 
-  const credential = {
+  const credential = createPublicKeyCredential({
     id: data.credentialId,
     rawId: rawId,
     type: data.type,
@@ -269,7 +319,7 @@ function reconstructGetResponse(data) {
         userHandle: data.userHandle || null,
       },
     }),
-  };
+  });
 
   console.info("[WEBAUTHN] Reconstructed get response", {
     authDataBytes: authDataBuf.byteLength,

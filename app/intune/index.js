@@ -8,7 +8,6 @@ const BROKER_PATH = "/com/microsoft/identity/broker1";
 const BROKER_INTERFACE = "com.microsoft.identity.Broker1";
 const PROTOCOL_VERSION = "0.0";
 
-// Get session bus instance
 const sessionBus = dbus.sessionBus();
 
 /**
@@ -150,7 +149,7 @@ async function waitForBrokerReady(retries, delay) {
       return;
     } catch (error) {
       if (error?.name === "org.freedesktop.DBus.Error.ServiceUnknown") {
-        throw new Error("Broker not found, ensure it's installed");
+        throw new Error("Broker not found, ensure it's installed", { cause: error });
       }
 
       if (attempt < retries) {

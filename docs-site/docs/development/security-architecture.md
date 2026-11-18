@@ -1,6 +1,6 @@
 # Security Architecture & Considerations
 
-This document outlines the security architecture, design decisions, and compensating controls implemented in Teams for Linux, particularly around the DOM access requirements and security trade-offs.
+This document outlines the security architecture, design decisions, and compensating controls implemented in Teams for Linux, particularly around the DOM access requirements and security trade-offs. The reasoning behind the renderer-side controls is recorded in [ADR-035](adr/035-renderer-trust-boundary.md).
 
 ## Security Context
 
@@ -72,6 +72,8 @@ const responseHeaders = {
 - **Recursive Payload Sanitization**: Removes dangerous properties (`__proto__`, `constructor`, `prototype`) from payloads at all nesting depths
 - **Prototype Pollution Protection**: Guards against object prototype manipulation with depth-limited recursion (max 10 levels)
 - **Request Validation**: Validates all IPC requests before processing
+- **Sender Pinning**: Channels only the screen-share picker uses (`desktop-capturer-get-sources`, `get-screen-sharing-displays`, `selected-source`, `close-view`, and the legacy picker's `source-selected`) are answered only when the sending frame shows a file inside the app directory (`isSenderAllowed`), so page script cannot capture the screen or pick a source on its own
+- **No Raw `ipcRenderer` in the Page**: With `contextIsolation: false`, anything `electronAPI` returns is usable by page script, so its listener helpers return nothing and strip Electron's IPC event (whose `sender` is the raw `ipcRenderer`) before calling back
 
 ```javascript
 function validateIpcChannel(channel, payload = null) {
@@ -121,7 +123,7 @@ _isAllowedTeamsDomain(hostname) {
 
 **Features**:
 - **`uncaughtException` handler**: Logs error details and exits with code 1 (process state unknown after uncaught exception)
-- **`unhandledRejection` handler**: Logs rejection details, allows process to continue (non-fatal)
+- **`unhandledRejection` handler**: Logs rejection details; network errors are ignored, anything else exits with code 1, so every promise-returning Electron call (for example `shell.openExternal`) must be caught
 - **Startup try/catch**: `handleAppReady()` wrapped with error logging and graceful `app.quit()` on failure
 
 **Protection**: Prevents silent process termination and provides diagnostic output for crash reports.
@@ -135,6 +137,42 @@ _isAllowedTeamsDomain(hostname) {
 - Applied to all incoming call notification arguments (`caller`, `text`, `image`) before passing to `spawn()`
 
 **Protection**: Defense-in-depth against edge cases in user-configured notification commands receiving untrusted data from Teams messages.
+
+#### 7. Webview Attach Blocked
+
+**Implementation**: `app/security/webviewGuard.js`, `webviewTag: false` in `app/mainAppWindow/browserWindowManager.js` and `profileViewManager.js`
+
+**Features**:
+- **`webviewTag: false`**: Nothing in the app or in Teams web uses `<webview>`, so the tag is off in the root window and every profile view
+- **App-wide `will-attach-webview` refusal**: Covers any webContents created later, including popups, since a guest can request its own preload with `sandbox=no` and that preload would run with full Node.js
+- **Sticker import signature check**: `customStickers` URL import saves a file only when it starts with the declared image type's signature, rather than trusting the server's content-type header alone (a format sanity check; the webview block is the actual protection)
+
+**Protection**: Keeps page script from turning a file on disk into code running with Node.js, which preserves the `nodeIntegration: false` boundary above.
+
+#### 8. Preload Trust Boundary
+
+**Implementation**: `app/browser/preload.js`, the browser tools under `app/browser/tools/`, `app/config/rendererConfig.js`; enforced by `tests/unit/preloadIpcLeak.test.js` and `tests/unit/preloadModules.test.js`
+
+**Features**:
+- **Init once, on the browser's event**: the `DOMContentLoaded` handler ignores synthetic events (`event.isTrusted`) and re-dispatches (module-level flag), so page script cannot make the preload hand out `ipcRenderer` a second time through patched built-ins
+- **Indexed module loop**: the module list is walked by index over own properties, with every entry setting its own `ipc` flag, because `for...of`, `Set.has` and `Object.prototype` lookups are all patchable from the page
+- **`ipcRenderer` in private fields under strict mode**: tools flagged `ipc: true` still receive the full `ipcRenderer` at init and keep it in `#private` fields; strict mode stops `EventEmitter`'s `this` (the raw `ipcRenderer`) from reaching sloppy-mode frames via V8's `CallSite.getThis`
+- **No generic `electronAPI.send`**: the page gets named methods bound to fixed channels; the profile channels and the two Graph channels that act as the user (`graph-api-search-people`, `graph-api-send-chat-message`) are pinned to the app page, while the other Graph channels, including `graph-api-create-calendar-event` which writes to the calendar, remain callable from the Teams page, and profile URLs must be `https`
+- **Credential-free renderer config**: `get-config` returns `toRendererConfig(config)`, without MQTT, basic-auth or client-certificate secrets
+
+**Protection**: Script in the Teams window cannot recover `ipcRenderer`, so it is bounded to the allowlisted channels with the preload's argument shaping, and it cannot read credentials (GHSA-58j7-22f8-6xqp).
+
+#### 9. Session Permission Handlers
+
+**Implementation**: `app/security/permissions.js`, installed on the default session and every profile partition
+
+**Features**:
+- **Trusted requesters get full access**: Teams and government Teams hosts, the Microsoft sign-in hosts, the configured URL, `https` profile URLs and the app's own `file:` pages
+- **Embedded frames keep only policy-gated permissions**: a cross-origin frame inside a trusted page (Whiteboard, Loop, SharePoint) may use media, display capture, clipboard and fullscreen, which Chromium already gates per frame with Permissions Policy, and nothing else
+- **Other pages may only open mail and phone links**: any other permission from a popup, an in-app link or a page navigated to is denied
+- **Denials logged once** per permission and origin, without the URL path
+
+**Protection**: Without these handlers Electron grants every request, so a page opened in an app window could use the microphone or camera without a prompt (GHSA-58j7-22f8-6xqp, item 3).
 
 ## Recommended User-Level Security
 
@@ -251,7 +289,9 @@ graph TB
 - ✅ **Microsoft's Infrastructure Security**: Teams web app runs on Microsoft's secured infrastructure with their security controls
 - ✅ **Domain Restrictions**: Application limited to Teams domains only, not arbitrary web content
 - ✅ **Node.js Access Prevented**: `nodeIntegration: false` maintains critical security boundary
-- ✅ **Comprehensive IPC Validation**: Channel allowlisting and payload sanitization
+- ✅ **Comprehensive IPC Validation**: Channel allowlisting, payload sanitization and sender pinning for privileged channels
+- ✅ **Preload Trust Boundary**: `ipcRenderer` never reachable from page script, renderer config without credentials
+- ✅ **Session Permission Policy**: device permissions granted only to trusted requesters
 - ✅ **Token Encryption**: Authentication tokens encrypted at rest using OS-level security
 
 **Technical Trade-offs** (Mitigated by Above):
@@ -270,6 +310,7 @@ graph TB
 **For Developers**:
 - Continue monitoring Teams web app changes that could affect security
 - Maintain IPC channel validation and domain restrictions
+- Follow the renderer rules in [ADR-035](adr/035-renderer-trust-boundary.md) for every new browser tool: strict mode, `ipcRenderer` in a private field, no Electron objects returned to the page, sender checks on new privileged channels
 - Keep dependencies updated and monitor security advisories
 
 ### Security Architecture Benefits

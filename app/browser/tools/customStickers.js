@@ -1,3 +1,5 @@
+"use strict";
+
 /**
  * Custom Stickers Browser Tool
  *
@@ -9,8 +11,9 @@
  * Clicking a sticker focuses Teams's chat compose box and dispatches a
  * synthetic ClipboardEvent('paste') carrying the image as a File. Teams's
  * editor (CKEditor 5) consumes the event the same way it handles a real
- * paste — validated end-to-end during the feasibility spike. See
- * spike/2476-stickers/SPIKE.md for the research and DESIGN.md for the design.
+ * paste — validated end-to-end during the feasibility spike (#2476). The spike
+ * notes were removed once the feature shipped; see git history for
+ * spike/2476-stickers/SPIKE.md and DESIGN.md.
  */
 
 const LOG_PREFIX = "[CUSTOM_STICKERS]";
@@ -19,16 +22,7 @@ const PANEL_ID = "tfl-sticker-panel";
 const STYLES_ID = "tfl-sticker-styles";
 const URL_INPUT_ID = "tfl-sticker-url-input";
 
-// Selector cascade mirrors the spike harness — most-specific first.
-const COMPOSE_SELECTORS = [
-  'div[id^="new-message-"]',
-  'div[contenteditable="true"][role="textbox"][aria-label*="message" i]',
-  'div[contenteditable="true"][role="textbox"]',
-  '[contenteditable="true"][aria-label*="message" i]',
-  '[data-tid*="ckeditor"]',
-  '[data-tid*="message-area"]',
-  '.ck-editor__editable',
-];
+const { COMPOSE_SELECTORS, findCompose } = require("../../helpers/composeBox");
 
 class CustomStickers {
   #enabled = false;
@@ -558,13 +552,7 @@ class CustomStickers {
   }
 
   #findCompose() {
-    for (const selector of COMPOSE_SELECTORS) {
-      const el = document.querySelector(selector);
-      if (el) {
-        return el;
-      }
-    }
-    return null;
+    return findCompose(document, COMPOSE_SELECTORS);
   }
 
   async #sendSticker(sticker) {

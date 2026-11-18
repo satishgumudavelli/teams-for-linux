@@ -19,6 +19,10 @@
   let periodicCheckInterval = null;
   let streamInactiveHandlers = [];
   let activeFrameRelay = null;
+  const resolutionConfig = globalThis.__tflScreenSharingResolution || {
+    enabled: false,
+    mode: "remove",
+  };
 
   // Known translations of "Stop sharing" / "Stop presenting" button text.
   // Used as fallback when CSS attribute selectors don't match (non-English locales).
@@ -52,7 +56,6 @@
     "הפסקת שיתוף",
   ];
 
-  // Helper function to disable audio in screen sharing constraints
   function disableAudioInConstraints(constraints, context) {
     if (constraints) {
       constraints.audio = false;
@@ -63,20 +66,115 @@
     }
   }
 
-  // Monitor for screen sharing streams and detect when they stop
+  // Teams requests screen share video capped to a fixed resolution (commonly
+  // 1080p), which blurs high-density/ultrawide monitors that get downscaled
+  // then upscaled by the compositor. Strip those caps so the capture uses the
+  // native resolution of the shared screen/window instead.
+  function stripResolutionConstraint(video) {
+    if (!video || typeof video !== "object") return video;
+
+    for (const name of ["width", "height"]) {
+      delete video[name];
+    }
+    if (video.mandatory) {
+      for (const name of ["minWidth", "maxWidth", "minHeight", "maxHeight", "width", "height"]) {
+        delete video.mandatory[name];
+      }
+    }
+    const dropKeys = (opt, keys) => {
+      const rest = { ...opt };
+      for (const k of keys) delete rest[k];
+      return rest;
+    };
+    if (Array.isArray(video.optional)) {
+      video.optional = video.optional
+        .map((opt) => dropKeys(opt, ["minWidth", "maxWidth", "minHeight", "maxHeight", "width", "height"]))
+        .filter((opt) => Object.keys(opt).length > 0);
+    }
+    if (Array.isArray(video.advanced)) {
+      video.advanced = video.advanced
+        .map((opt) => dropKeys(opt, ["width", "height"]))
+        .filter((opt) => Object.keys(opt).length > 0);
+    }
+    return video;
+  }
+
+  function configureResolutionConstraint(video) {
+    if (!resolutionConfig.enabled || !video || typeof video !== "object") {
+      return video;
+    }
+    if (
+      resolutionConfig.mode === "override" &&
+      !(resolutionConfig.width > 0 && resolutionConfig.height > 0)
+    ) {
+      // An invalid override keeps Teams' own constraints rather than going native.
+      return video;
+    }
+
+    stripResolutionConstraint(video);
+    if (
+      resolutionConfig.mode === "override" &&
+      resolutionConfig.width > 0 &&
+      resolutionConfig.height > 0
+    ) {
+      if (video.mandatory || video.optional) {
+        video.mandatory = video.mandatory || {};
+        video.mandatory.maxWidth = resolutionConfig.width;
+        video.mandatory.maxHeight = resolutionConfig.height;
+      } else {
+        video.width = { ideal: resolutionConfig.width, max: resolutionConfig.width };
+        video.height = { ideal: resolutionConfig.height, max: resolutionConfig.height };
+      }
+    }
+    return video;
+  }
+
+  function removeResolutionCapsInConstraints(constraints, context) {
+    const video = constraints?.video;
+    if (!resolutionConfig.enabled || !video || typeof video !== "object") return;
+    configureResolutionConstraint(video);
+    console.debug(`[SCREEN_SHARE_DIAG] Resolution caps removed for ${context}`);
+  }
+
+  // Teams also re-applies a resolution cap on the *already-running*
+  // screen-share track via track.applyConstraints() to adapt quality on the
+  // fly (see #2432/#2437, where this same mechanism let a camera-resolution
+  // override leak into screen-share tracks). The constraints payload here
+  // never carries chromeMediaSource, so a display-capture track can only be
+  // recognised via getSettings().displaySurface.
+  function patchApplyConstraintsForScreenShare() {
+    if (typeof MediaStreamTrack === "undefined") return;
+    const original = MediaStreamTrack.prototype.applyConstraints;
+    if (!original) return;
+
+    MediaStreamTrack.prototype.applyConstraints = function (constraints) {
+      if (
+        resolutionConfig.enabled &&
+        this.kind === "video" &&
+        this.getSettings?.().displaySurface &&
+        constraints
+      ) {
+        configureResolutionConstraint(constraints);
+        console.debug("[SCREEN_SHARE_DIAG] Resolution caps removed for applyConstraints");
+      }
+      return original.call(this, constraints);
+    };
+  }
+
   function monitorScreenSharing() {
+    patchApplyConstraintsForScreenShare();
+
     // Guard against missing mediaDevices API (e.g. on Chrome error pages)
     if (!navigator.mediaDevices?.getDisplayMedia) {
       console.debug("[SCREEN_SHARE_DIAG] navigator.mediaDevices.getDisplayMedia not available, skipping");
       return;
     }
 
-    // Hook into getDisplayMedia for screen sharing
     const originalGetDisplayMedia = navigator.mediaDevices.getDisplayMedia.bind(
       navigator.mediaDevices
     );
 
-    // Also hook into getUserMedia for fallback detection
+    // getUserMedia is also hooked for fallback detection
     const originalGetUserMedia = navigator.mediaDevices.getUserMedia.bind(
       navigator.mediaDevices
     );
@@ -86,6 +184,8 @@
 
       // Force disable all audio in screen sharing to prevent echo issues
       disableAudioInConstraints(constraints, "getDisplayMedia");
+      // Ensure capture uses the screen/window's native resolution (#quality)
+      removeResolutionCapsInConstraints(constraints, "getDisplayMedia");
 
       // Delegate picking to the platform's native flow:
       //   X11 / Win / macOS: Chromium calls our setDisplayMediaRequestHandler,
@@ -128,6 +228,8 @@
 
         // Force disable audio for screen sharing streams to prevent echo
         disableAudioInConstraints(constraints, "getUserMedia screen sharing");
+        // Ensure capture uses the screen/window's native resolution
+        removeResolutionCapsInConstraints(constraints, "getUserMedia screen sharing");
       }
 
       return originalGetUserMedia(constraints)
@@ -148,7 +250,6 @@
     };
   }
 
-  // Centralized handler for screen sharing streams
   function handleScreenShareStream(stream, source) {
     console.debug(`[SCREEN_SHARE_DIAG] Processing stream from ${source} (${activeStreams.length} active)`);
 
@@ -159,7 +260,6 @@
       return;
     }
 
-    // Check if we're creating a duplicate session - this could cause issues
     if (isScreenSharing) {
       console.warn(`[SCREEN_SHARE_DIAG] Multiple screen sharing sessions detected - total: ${activeStreams.length + 1}`);
     }
@@ -190,20 +290,15 @@
     stream.addEventListener("inactive", inactiveHandler);
     streamInactiveHandlers.push({ stream, handler: inactiveHandler });
 
-    // Start UI monitoring for stop sharing buttons
     startUIMonitoring();
-
-    // Start periodic fallback check for track state and button detection
     startPeriodicCheck();
 
-    // Track stream and tracks for cleanup when they end
     const trackingVideoTracks = stream.getVideoTracks();
     for (const [index, track] of trackingVideoTracks.entries()) {
       activeMediaTracks.push(track);
 
       track.addEventListener("ended", () => {
         console.debug(`[SCREEN_SHARE_DIAG] Video track ${index} ended`);
-        // Check if all tracks have ended to trigger cleanup
         const allTracksEnded = activeMediaTracks.every(t => t.readyState === "ended");
         if (allTracksEnded && isScreenSharing) {
           console.debug("[SCREEN_SHARE_DIAG] All video tracks ended, stopping screen sharing");
@@ -370,7 +465,6 @@
     }
   }
 
-  // Function to handle stream ending - used by UI button detection
   function handleStreamEnd(reason) {
     console.debug(`[SCREEN_SHARE_DIAG] Stream ending: ${reason} (${activeStreams.length} streams, ${activeMediaTracks.length} tracks)`);
 
@@ -378,7 +472,6 @@
       isScreenSharing = false;
       console.debug("[SCREEN_SHARE_DIAG] Screen sharing stopped");
 
-      // Clean up monitoring
       stopPeriodicCheck();
       stopUIMonitoring();
       stopVideoFrameRelay();
@@ -389,13 +482,11 @@
         electronAPI.sendScreenSharingStopped();
       }
 
-      // Remove stream inactive listeners to prevent memory leaks
       for (const { stream, handler } of streamInactiveHandlers) {
         stream.removeEventListener("inactive", handler);
       }
       streamInactiveHandlers = [];
 
-      // Clear active streams and tracks
       activeStreams = [];
       activeMediaTracks = [];
       
@@ -403,7 +494,6 @@
     }
   }
 
-  // Handle stop sharing button click
   function handleStopButtonClick(button) {
     console.debug(`[SCREEN_SHARE_DIAG] Stop sharing button clicked: "${button.textContent?.trim()}"`);    
     setTimeout(() => {
@@ -411,7 +501,6 @@
     }, 100);
   }
 
-  // Set up monitoring for a single stop button
   function setupStopButtonMonitoring(button) {
     if (!button.dataset.teamsMonitored) {
       button.dataset.teamsMonitored = "true";
@@ -421,10 +510,8 @@
     }
   }
 
-  // Track whether stop button exists in current UI state
   let stopButtonExists = false;
 
-  // Check if a button matches known stop sharing patterns in any language
   function isStopSharingButton(button) {
     const text = (button.textContent || "").trim().toLowerCase();
     const title = (button.getAttribute("title") || "").toLowerCase();
@@ -438,7 +525,6 @@
     );
   }
 
-  // Process discovered stop sharing buttons
   function processStopSharingButtons() {
     const stopButtons = new Set();
 
@@ -482,7 +568,6 @@
     }
   }
 
-  // Start monitoring UI for "Stop sharing" buttons
   function startUIMonitoring() {
     if (uiObserver) return;
 
@@ -497,11 +582,9 @@
       attributeFilter: ["class", "data-tid", "title", "aria-label"],
     });
 
-    // Initial check to detect current button state
     processStopSharingButtons();
   }
 
-  // Stop monitoring UI
   function stopUIMonitoring() {
     if (uiObserver) {
       uiObserver.disconnect();
@@ -537,7 +620,6 @@
     }, 5000);
   }
 
-  // Stop periodic check
   function stopPeriodicCheck() {
     if (periodicCheckInterval) {
       clearInterval(periodicCheckInterval);
@@ -545,7 +627,6 @@
     }
   }
 
-  // Initialize monitoring when the page is ready
   function initializeScreenSharingMonitoring() {
     console.debug("[SCREEN_SHARE_DIAG] Initializing screen sharing monitoring");
 

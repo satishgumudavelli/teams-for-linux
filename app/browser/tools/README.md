@@ -121,6 +121,12 @@ Fixes camera video stretching when moving Teams between monitors with different 
 #### [wakeLock.js](wakeLock.js)
 Prevents system sleep during meetings and active calls.
 
+#### [documentPictureInPicture.js](documentPictureInPicture.js)
+Replaces `window.documentPictureInPicture` so the Teams web Call Monitor ([MC1462921](https://mc.merill.net/message/MC1462921)) can show its floating call controls. Electron exposes the API, but the window from `requestWindow()` is closed about a millisecond after it resolves and is never drawn. The replacement opens a same-origin `about:blank` popup under a frame name the main process picks at random each launch and passes in through the config, so cross-origin frames inside Teams cannot open the window themselves. The main process ([../../mainAppWindow/documentPictureInPicture.js](../../mainAppWindow/documentPictureInPicture.js)) allows it as an always-on-top window capped at 800×600. All other `about:blank` popups stay denied. Teams renders its compact meeting view into the popup's document, with the event handlers running in the main window, so the call itself never leaves the main window. Returning to the meeting, closing the popup or pressing its share button moves the view back to the main window, and sharing then runs as usual. The tool logs `[DOCUMENT_PIP]` lines when Teams requests a window or registers the `enterpictureinpicture` media session action. These lines contain no meeting or user data.
+
+**Configuration**: `media.documentPictureInPicture` (default `true`; set `false` to fall back to Electron's native, broken API)
+**Limitations**: user activation from a click in the popup does not reach the main window, as it does with native PiP, so gesture-gated APIs called from popup buttons (clipboard writes, fullscreen) may be refused. Chrome opens PiP automatically on tab switch through the `enterpictureinpicture` media session action, and Electron has no equivalent trigger. Wayland compositors may not honour always-on-top.
+
 ### UI & Display
 
 #### [theme.js](theme.js)
@@ -149,8 +155,11 @@ Implements custom keyboard shortcuts for in-app actions like zoom control and na
 #### [frameless.js](frameless.js)
 Ensures proper functionality of the top bar in frameless mode (i.e. without native window title bar).
 
+#### [integratedTitleBar.js](integratedTitleBar.js)
+The renderer side of `window.titleBar: "integrated"` (client-side decorations). It keeps the controls in the Teams top bar clickable inside the drag region. It reports the bar's height and colour to the main process (`title-bar-overlay-update`). The native window controls are drawn on that colour at zero alpha, so they sit directly on the page while their hover background still matches it. When Teams' own buttons would sit under the window controls, it reserves space for them. On pages with no Teams top bar, such as sign-in, it adds a drag strip along the top and hides the page scrollbar. Needs `ipcRenderer`. The main-process half is `app/mainAppWindow/titleBar.js`.
+
 #### Global Shortcuts System (Main Process)
-System-wide keyboard shortcuts that work even when Teams is not focused. When triggered, the keyboard event is forwarded to Teams, which handles it with its built-in shortcuts. Configured via the `globalShortcuts` array in `config.json`.
+System-wide keyboard shortcuts that work even when Teams is not focused. When triggered, the keyboard event is forwarded to Teams, which handles it with its built-in shortcuts. Configured via the `shortcuts.global` array in `config.json` (the flat `globalShortcuts` is deprecated but still accepted).
 
 **Disabled by default** - opt-in by adding shortcuts to your config.
 
@@ -158,21 +167,24 @@ System-wide keyboard shortcuts that work even when Teams is not focused. When tr
 
 **Common Teams Shortcuts**:
 - `Ctrl+Shift+M` - Toggle mute/unmute
-- `Ctrl+Shift+O` - Toggle video on/off
+- `Ctrl+Shift+O` - Toggle video (Microsoft lists this for the desktop client only)
+- `Ctrl+Shift+H` - Leave/hang up call
 - `Ctrl+Shift+K` - Raise/lower hand
 - `Ctrl+Shift+B` - Toggle background blur
 - `Ctrl+Shift+E` - Start/stop screen sharing
-- `Ctrl+Shift+D` - Toggle chat
+- `Ctrl+Shift+D` - Decline call
 - `Ctrl+Shift+C` - Toggle calendar
 - `Ctrl+Shift+/` - Show keyboard shortcuts
 
 **Configuration Example** (add to config.json to enable):
 ```json
 {
-  "globalShortcuts": [
-    "Control+Shift+M",
-    "Control+Shift+O"
-  ]
+  "shortcuts": {
+    "global": [
+      "Control+Shift+M",
+      "Control+Shift+O"
+    ]
+  }
 }
 ```
 
@@ -191,6 +203,12 @@ Provides authentication token caching and management for improved login persiste
 Monitors Teams user status and sends updates to the main process via IPC for MQTT publishing to home automation systems. Uses a dual-layer detection strategy with MutationObserver for real-time DOM changes (debounced) and polling as a fallback. See the [MQTT module README](../../mqtt/README.md) for full documentation.
 
 **Configuration**: Requires `mqtt.enabled: true` in config
+**Requires**: `ipcRenderer` passed during initialization
+
+#### [meetingStartDetector.js](meetingStartDetector.js)
+Detection of a scheduled meeting starting (issue #2587). Primary path: Teams' command-reporting stream (via activityHub) carries the meeting-start banner/toast as structured, locale-independent data (intentLevel `LiveMeetingStatus`, toastType `MeetingStart`), deduplicated per callId/toastId. Fallback path: a MutationObserver scoped to toast/alert surfaces with configurable case-insensitive regex patterns (`mqtt.meetingStartDetection.patterns`). Either path notifies the main process via IPC so the `meeting-started` MQTT topic pulses. Matched toast text (which can contain a person's name) is never logged or published.
+
+**Configuration**: Requires `mqtt.enabled: true` and `mqtt.meetingStartDetection.enabled: true` in config
 **Requires**: `ipcRenderer` passed during initialization
 
 ## Architecture Patterns

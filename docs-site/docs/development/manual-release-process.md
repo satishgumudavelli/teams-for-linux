@@ -97,17 +97,36 @@ When the Release PR merges to main:
 - Snap edge channel publishes with a version suffix (e.g., `2.7.5-edge.g1a2b3c4`) to distinguish it from the release build
 
 Then:
-1. Promote GitHub draft → full release
-   - This triggers Flatpak
+1. Publish the GitHub draft as a pre-release: `gh release edit vX.Y.Z --draft=false --prerelease`
    - This triggers the **Snap Release** workflow, which builds and publishes the release version to the **candidate** channel
-2. Test the Snap candidate version
-3. Manually promote Snap candidate → stable: `snapcraft release teams-for-linux <revision> stable`
+   - This triggers the **Flatpak Smoke Build**, which builds the Flathub manifest against the released deb
+   - This triggers the **Flathub Beta Bump**, which opens a version-bump PR against the packaging repo's `beta` branch. It only does so for a pre-release, so keep the flag on until step 5
+2. Merge the [Flathub beta bump PR](#flathub-beta-branch) once flathubbot's test build passes, so Flatpak users can test the pre-release from `flathub-beta`
+3. Test the Snap candidate version
+4. Manually promote Snap candidate → stable: `snapcraft release teams-for-linux <revision> stable`
+5. Clear the pre-release flag once the release has soaked: `gh release edit vX.Y.Z --prerelease=false`
+
+:::warning Flathub stable does not move until the pre-release flag is cleared
+The Flathub `master` manifest tracks `releases/latest`, and that endpoint skips pre-releases. So a release left flagged as a pre-release only ever reaches `flathub-beta` (step 2), never Flatpak stable users, no matter how long it sits. Step 5 is what moves both the `latest` pointer and Flathub stable, and it is easy to forget because nothing fails or warns when it is skipped.
+:::
 
 :::info Snap Channels
 - **edge** — Every push to main. Versioned with commit SHA suffix (e.g., `2.7.5-edge.g1a2b3c4`)
 - **candidate** — Automatically published when a GitHub Release is published. Uses the clean release version (e.g., `2.7.5`)
 - **stable** — Manual promotion from candidate after testing
 :::
+
+### Flathub beta branch
+
+The Flathub packaging repo has a `beta` branch that Flathub builds into the `flathub-beta` remote, which is how Flatpak users test a pre-release before it reaches stable. Flathub's hosted update checker only runs against a repo's default branch (`master`), so it never opens an update PR for `beta`; the `x-checker-data` queries on that branch describe what it should track, but nothing executes them.
+
+The bump itself is automated. The **Flathub Beta Bump** workflow (`.github/workflows/flathub-beta-bump.yml`) runs when a release is published, exits early unless it is a pre-release, takes the two deb checksums from the release asset digests and computes the metainfo checksum from the file at the tag, rewrites the three sources in the `beta` manifest, pushes a `bump-beta-<version>` branch to `flathub/com.github.IsmaelMartinez.teams_for_linux` and opens a `chore: bump beta to <version>` PR against `beta`. The push needs the `FLATHUB_TOKEN` repository secret; without it the workflow still computes the bump and writes the diff to the job summary so it can be applied by hand.
+
+Merging that PR is left to the maintainer on purpose: Flathub's own `builds/x86_64` runs on PRs into `beta` and is the first real build of the manifest, so wait for flathubbot's "Test build succeeded" comment before merging. The merge is what publishes to `flathub-beta`.
+
+If the run was missed or needs repeating, dispatch it by hand with the tag: `gh workflow run flathub-beta-bump.yml -f tag=vX.Y.Z`. Re-running against a version the manifest already points at is a no-op.
+
+Keep `beta` otherwise in sync with `master`, since the only intended difference is the version it points at plus any packaging change deliberately under test.
 
 ## Changelog Categories
 
@@ -155,7 +174,9 @@ Build triggers automatically
      ↓
 Publish → Draft release, Snap edge (with commit SHA suffix)
      ↓
-Promote draft → Full release, Snap candidate, Flatpak
+Publish draft as pre-release → Snap candidate, Flatpak smoke build, Flathub beta bump PR
+     ↓
+Merge beta bump PR once flathubbot builds → flathub-beta
      ↓
 Test candidate → Promote Snap candidate → stable
 ```

@@ -155,7 +155,7 @@ async function loadSources() {
   }
   state.displays = Array.isArray(displays) ? displays : [];
 
-  let sources = [];
+  let sources;
   try {
     sources = await globalThis.api.desktopCapturerGetSources({
       types: ["window", "screen"],
@@ -334,6 +334,10 @@ function buildScreenTile(item) {
   tile.addEventListener("focus", () => setHoveredScreen(item.source.id));
   tile.addEventListener("blur", () => setHoveredScreen(null));
   tile.addEventListener("click", () => setSelectedScreen(item.source.id));
+  tile.addEventListener("dblclick", () => {
+    setSelectedScreen(item.source.id);
+    shareSelection();
+  });
   tile.addEventListener("keydown", (e) => {
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
@@ -522,6 +526,10 @@ function buildWindowTile(source) {
   tile.appendChild(metaRow);
 
   tile.addEventListener("click", () => setSelectedWindow(source.id));
+  tile.addEventListener("dblclick", () => {
+    setSelectedWindow(source.id);
+    shareSelection();
+  });
   tile.addEventListener("keydown", (e) => {
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
@@ -541,7 +549,7 @@ function buildWindowTile(source) {
 // replacement would be double-escaped) as defence-in-depth — CodeQL
 // flags the partial-escape pattern even when it cannot be exploited.
 function cssEscapeUrl(url) {
-  return url.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  return url.replaceAll("\\", String.raw`\\`).replaceAll('"', String.raw`\"`);
 }
 
 function switchTab(tab) {
@@ -627,8 +635,10 @@ function pickClosestAligned(items, cur, aligned) {
 function shareSelection() {
   if (!state.selectedId) return;
   const quality = QUALITY_OPTIONS.find((q) => q.id === state.quality) || DEFAULT_QUALITY;
+  const selected = state.sources.find((s) => s.id === state.selectedId);
   globalThis.api.selectedSource({
     id: state.selectedId,
+    name: selected?.name || "",
     screen: { width: quality.width, height: quality.height, name: quality.label },
   });
 }

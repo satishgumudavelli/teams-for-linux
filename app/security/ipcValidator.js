@@ -5,6 +5,9 @@
  * for disabled contextIsolation and sandbox features.
  */
 
+const path = require('node:path');
+const { fileURLToPath } = require('node:url');
+
 // Allowlist of legitimate IPC channels used by Teams for Linux
 const allowedChannels = new Set([
   // Core application channels
@@ -17,6 +20,8 @@ const allowedChannels = new Set([
   // Zoom and display controls
   'get-zoom-level',
   'save-zoom-level',
+  // Integrated title bar: renderer reports the Teams top bar's height and colour
+  'title-bar-overlay-update',
   
   // Screen sharing and desktop capture (sorted alphabetically)
   'cancel-desktop-media',
@@ -29,7 +34,7 @@ const allowedChannels = new Set([
   'get-screen-sharing-status',
   'resize-preview-window',
   // main → renderer only (webContents.postMessage); not gated by this validator,
-  // listed here so the allowlist stays authoritative per CLAUDE.md.
+  // listed here so the allowlist stays authoritative per AGENTS.md.
   'screen-share-port',
   'screen-sharing-started',
   'screen-sharing-stopped',
@@ -41,9 +46,19 @@ const allowedChannels = new Set([
   // Notifications and user interaction
   'play-notification-sound',
   'show-notification',
+  // main -> renderer only (webContents.send to the renderer that created the
+  // notification). Not gated by this validator, which wraps ipcMain
+  // handle/on/once only; listed so the allowlist stays authoritative. No
+  // ipcMain handler exists for either, so these entries grant a renderer nothing.
   'notification-closed',
+  'notification-clicked',
   'notification-show-toast',
   'notification-toast-click',
+  // Handled per toast on its own webContents.ipc, not ipcMain.
+  'notification-toast-ready',
+  // Multi-account: a user click on a `web`-method toast, reported by the
+  // raising renderer so main can bring that profile forward (sender-resolved).
+  'notification-web-clicked',
   'user-status-changed',
   'set-badge-count',
   'tray-update',
@@ -60,6 +75,9 @@ const allowedChannels = new Set([
   // Media status (camera/microphone)
   'camera-state-changed',
   'microphone-state-changed',
+
+  // Scheduled-meeting-start toast detection for MQTT (#2587)
+  'meeting-started',
   
   // Authentication and forms
   'submitForm',
@@ -128,6 +146,11 @@ const allowedChannels = new Set([
   'webauthn:get',
   'webauthn:pin-submit',
   'webauthn:pin-cancel',
+  'webauthn:touch-cancel',
+
+  // Shared secure-prompt dialog (smartcard / PKCS#11 client-certificate PIN)
+  'secure-prompt:submit',
+  'secure-prompt:cancel',
 
   // Manage-profiles dialog (Phase 1c.2). Inline rename forwards to
   // `ProfilesManager.update()`; remove triggers a native confirmation
@@ -135,8 +158,48 @@ const allowedChannels = new Set([
   // dialog. State pushes flow main → renderer over `manage-profile-state`
   // (no allowlist needed for that direction).
   'manage-profile-rename',
+  // Pin/unpin toggle (Phase 1c.2 shortcuts). Forwards to
+  // `ProfilesManager.update(id, { pinned })`; main enforces the max-5 cap
+  // (the Ctrl+Alt+1…5 shortcut slots) and rejects past it.
+  'manage-profile-pin',
+  // Per-profile notification/sound toggles (Phase 2). Forwards to
+  // `ProfilesManager.update(id, { disableNotifications, muted })`.
+  'manage-profile-notifications',
   'manage-profile-remove',
-  'manage-profile-close'
+  'manage-profile-close',
+
+  // Bottom-left switcher pill (Phase 1c.2). The pill reuses the
+  // `profile-list` / `profile-get-active` / `profile-switch` channels above
+  // for its data; these are the pill-specific additions. open-add/open-manage
+  // open the existing dialogs (handled in `Menus`); set-expanded grows the view
+  // to full-window while the dropdown is open (handled in `ProfileViewManager`).
+  // State flows main → renderer over `profile-switcher-state` (send direction,
+  // not gated; listed for an authoritative allowlist per AGENTS.md). All are
+  // registered only when `multiAccount.enabled === true`.
+  'profile-switcher-open-add',
+  'profile-switcher-open-manage',
+  'profile-switcher-set-expanded',
+  'profile-switcher-state',
+  // main → renderer: per-profile unread counts for the pill's dot and row
+  // badges (ADR-020 Phase 2). Own channel so badge ticks never re-read the
+  // settings store the full state push needs.
+  'profile-switcher-unread',
+
+  // Per-profile notification flags (ADR-020 Phase 2). A Teams renderer pulls
+  // its own profile's { disableNotifications, muted } (resolved from the
+  // sender); main pushes `profile-notification-flags` (send direction,
+  // listed for completeness) when that profile is updated.
+  'profile-get-notification-flags',
+  'profile-notification-flags',
+
+  // Aggregate tray badge (ADR-020 Phase 2). The renderer's reply to main's
+  // render-aggregate-badge request: the summed unread count composited onto
+  // the tray icon by trayIconRenderer's canvas path. Matched by requestId
+  // and sender identity in main; registered only when multi-account is on.
+  'aggregate-badge-rendered',
+  // main → renderer only (webContents.send); not gated by this validator,
+  // listed so the allowlist stays authoritative per AGENTS.md.
+  'render-aggregate-badge'
 ]);
 
 const DANGEROUS_PROPS = new Set(['__proto__', 'constructor', 'prototype']);
@@ -184,4 +247,58 @@ function validateIpcChannel(channel, payload = null) {
   return true;
 }
 
-module.exports = { validateIpcChannel, allowedChannels };
+// Channels only local app pages may use, never a web page in the Teams window.
+// The screen-share picker (app/screenSharing/index.html): capturing the screen
+// or picking a source (GHSA-3vg9-cwq9-p773). The profile switcher, the profile
+// dialogs and Quick Chat (app/profileSwitcher, app/profileDialogs,
+// app/quickChat): adding a profile would let a page persist a URL that loads
+// with the preload on every start and is trusted for device permissions, and
+// the Graph channels send messages as the user (GHSA-58j7-22f8-6xqp).
+const appPageOnlyChannels = new Set([
+  'close-view',
+  'desktop-capturer-get-sources',
+  'get-screen-sharing-displays',
+  'selected-source',
+  'source-selected',
+  'profile-list',
+  'profile-get-active',
+  'profile-switch',
+  'profile-add',
+  'profile-update',
+  'profile-remove',
+  'add-profile-submit',
+  'add-profile-cancel',
+  'manage-profile-rename',
+  'manage-profile-pin',
+  'manage-profile-notifications',
+  'manage-profile-remove',
+  'manage-profile-close',
+  'graph-api-search-people',
+  'graph-api-send-chat-message',
+]);
+
+const APP_ROOT = path.join(__dirname, '..');
+
+/**
+ * Check that the frame sending an IPC message may use the channel.
+ * Channels outside appPageOnlyChannels accept any sender; those inside accept
+ * only frames showing a file shipped in the app directory.
+ *
+ * @param {string} channel
+ * @param {{ senderFrame?: { url?: string } | null }} event
+ * @returns {boolean}
+ */
+function isSenderAllowed(channel, event) {
+  if (!appPageOnlyChannels.has(channel)) return true;
+  // senderFrame is a getter that throws once the frame is disposed, so it is
+  // read inside the try: a gone frame is simply refused.
+  try {
+    const url = event?.senderFrame?.url;
+    if (typeof url !== 'string' || !url.startsWith('file:')) return false;
+    return fileURLToPath(url).startsWith(APP_ROOT + path.sep);
+  } catch {
+    return false;
+  }
+}
+
+module.exports = { validateIpcChannel, isSenderAllowed, allowedChannels, appPageOnlyChannels };

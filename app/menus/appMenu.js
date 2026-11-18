@@ -1,5 +1,7 @@
 const { shell } = require("electron");
 const buildProfilesMenu = require("./profilesMenu");
+const buildThemesMenu = require("./themesMenu");
+const themeIcon = require("./themeIcon");
 
 exports = module.exports = (Menus) => ({
   label: "Teams for Linux",
@@ -63,6 +65,7 @@ exports = module.exports = (Menus) => ({
       type: "separator",
     },
     getSettingsMenu(Menus),
+    getAppIconMenu(Menus),
     getPreferencesMenu(),
     getNotificationsMenu(Menus),
     ...(Menus.configGroup.startupConfig.multiAccount?.enabled
@@ -103,6 +106,8 @@ function getSettingsMenu(Menus) {
   return {
     label: "Settings",
     submenu: [
+      buildThemesMenu(Menus),
+      { type: "separator" },
       {
         label: "Save",
         click: () => Menus.saveSettings(),
@@ -110,6 +115,63 @@ function getSettingsMenu(Menus) {
       {
         label: "Restore",
         click: () => Menus.restoreSettings(),
+      },
+      {
+        type: "separator",
+      },
+      // The startup warning names the deprecated options; this turns that into
+      // something the user can act on in one click (ADR-025, #2913).
+      //
+      // Caught rather than left to float: app/index.js exits the process on any
+      // non-network unhandled rejection, so a failing dialog here would take
+      // the app down. The reason is not logged, since it can carry local paths.
+      {
+        label: "Show Updated Config…",
+        click: () =>
+          Menus.showMigratedConfig().catch(() =>
+            console.error("[Config] Could not show the updated config", {
+              failed: true,
+            }),
+          ),
+      },
+      // Most config options are restart-only, so the file is the interface.
+      // Its directory differs per packaging format (deb, snap, flatpak,
+      // source), which is not something anyone should have to look up.
+      {
+        label: "Open config file",
+        click: () => Menus.openConfigFile(),
+      },
+      {
+        label: "Open config folder",
+        click: () => Menus.openConfigFolder(),
+      },
+    ],
+  };
+}
+
+function getAppIconMenu(Menus) {
+  const hasCustomIcon = !!Menus.configGroup.startupConfig.appIcon?.trim();
+  return {
+    label: "App Icon",
+    submenu: [
+      {
+        label: "Choose App Icon…",
+        click: () => Menus.chooseAppIcon(),
+      },
+      {
+        label: "Also use it for the taskbar and launcher",
+        type: "checkbox",
+        visible: themeIcon.supported(),
+        enabled: hasCustomIcon,
+        checked:
+          hasCustomIcon &&
+          themeIcon.installed({ windowClass: Menus.configGroup.startupConfig.class }),
+        click: () => Menus.toggleThemeIcon(),
+      },
+      {
+        label: "Reset to default",
+        enabled: hasCustomIcon,
+        click: () => Menus.resetAppIcon(),
       },
     ],
   };

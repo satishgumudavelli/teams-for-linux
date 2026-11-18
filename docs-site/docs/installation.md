@@ -109,6 +109,14 @@ sudo emerald install teams-for-linux
 sudo snap install teams-for-linux
 ```
 
+:::tip Audio/Webcam Hotplug on Modern Distros
+On Ubuntu 24.04+ or distributions with AppArmor 4.x, connect the `hardware-observe` interface to allow media device hotplug detection via netlink without AppArmor sandbox denial loops:
+
+```bash
+sudo snap connect teams-for-linux:hardware-observe
+```
+:::
+
 :::tip Update Frequency
 Flatpak is the slowest update channel — it only receives a new version after the release has reached 100% across all other channels. Snap stable is the next slowest, with manual promotion after testing. If you prefer fewer update notifications, these are good choices. See the [Release Cadence](development/manual-release-process.md#release-cadence) section for details.
 :::
@@ -123,6 +131,33 @@ flatpak install flathub com.github.IsmaelMartinez.teams_for_linux
 
 <a href='https://flathub.org/apps/details/com.github.IsmaelMartinez.teams_for_linux'><img width='170' alt='Download on Flathub' src='https://flathub.org/assets/badges/flathub-badge-en.png'/></a>
 
+#### Flathub Beta Channel (Pre-releases)
+
+Pre-releases are published to the Flathub beta remote before they reach the stable Flathub build. Following the beta remote is the most useful thing a Flatpak user can do for this project, because sandbox and permission changes can be built by the Flathub buildbot but cannot be tested by the maintainer, who has no Linux desktop available.
+
+```bash
+flatpak remote-add --if-not-exists flathub-beta https://flathub.org/beta-repo/flathub-beta.flatpakrepo
+flatpak install flathub-beta com.github.IsmaelMartinez.teams_for_linux//beta
+```
+
+The beta build is a separate branch of the same application ID, so it installs alongside the stable one rather than replacing it. That matters when you launch it: the desktop launcher and a bare `flatpak run com.github.IsmaelMartinez.teams_for_linux` both keep starting the stable build, so run the beta explicitly, otherwise you will think you are testing the pre-release when you are not.
+
+```bash
+flatpak run com.github.IsmaelMartinez.teams_for_linux//beta
+```
+
+To go back to stable, remove the beta branch:
+
+```bash
+flatpak uninstall com.github.IsmaelMartinez.teams_for_linux//beta
+```
+
+If the install fails with the app not being found on `flathub-beta`, there is no beta build published at the moment. The beta remote only carries a build while a pre-release is being tested, so use the stable Flathub install above and try again after the next release.
+
+:::note
+The beta remote carries pre-release builds and packaging changes that are still being validated, so expect the occasional rough edge. If you hit one, please [open an issue](https://github.com/IsmaelMartinez/teams-for-linux/issues) and mention that you are on the beta remote.
+:::
+
 ## Manual Installation
 
 ### Download from GitHub Releases
@@ -134,6 +169,8 @@ flatpak install flathub com.github.IsmaelMartinez.teams_for_linux
    - **rpm** - Red Hat/Fedora package
    - **snap** - Universal snap package
    - **tar.gz** - Portable archive
+
+Packages are built for x86_64 and arm64. 32-bit ARM (armv7l) builds ended with the move to Electron 44, which no longer ships 32-bit binaries; existing armv7l installs keep working but receive no further updates.
 
 ### Package Installation
 
@@ -168,6 +205,10 @@ chmod +x teams-for-linux_*.AppImage
 
 :::tip AppImage Integration
 For AppImage files, install [`AppImageLauncher`](https://github.com/TheAssassin/AppImageLauncher) for better desktop integration, including automatic menu entries and file associations.
+:::
+
+:::note FUSE requirement
+From 2.30.0 the AppImage uses the static AppImage runtime, so `libfuse2` is no longer needed. It still mounts itself through FUSE, which needs the `fusermount` or `fusermount3` command (the `fuse` or `fuse3` package; most desktop distributions install one). Where FUSE is not available at all, such as in some containers, run it with `./teams-for-linux_*.AppImage --appimage-extract-and-run`.
 :::
 
 #### Portable Installation (tar.gz)
@@ -231,10 +272,10 @@ teams-for-linux --user-data-dir=/path/to/custom/profile
 
 ```bash
 # Work profile
-teams-for-linux --user-data-dir=~/.config/teams-work --class=teams-work
+teams-for-linux --user-data-dir=~/.config/teams-work --window.class=teams-work
 
 # Personal profile  
-teams-for-linux --user-data-dir=~/.config/teams-personal --class=teams-personal
+teams-for-linux --user-data-dir=~/.config/teams-personal --window.class=teams-personal
 ```
 
 See [Multiple Instances](multiple-instances.md) for detailed setup.

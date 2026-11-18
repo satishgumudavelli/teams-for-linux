@@ -73,8 +73,8 @@ jobs:
             // Group artifacts by platform
             const linuxX64 = buildArtifacts.find(a => a.name.includes('linux-x64'));
             const linuxArm64 = buildArtifacts.find(a => a.name.includes('linux-arm64'));
-            const linuxArmv7l = buildArtifacts.find(a => a.name.includes('linux-armv7l'));
-            const macos = buildArtifacts.find(a => a.name.includes('macos'));
+            const macosX64 = buildArtifacts.find(a => a.name.includes('macos-x64'));
+            const macosArm64 = buildArtifacts.find(a => a.name.includes('macos-arm64'));
             const windows = buildArtifacts.find(a => a.name.includes('windows'));
 
             let body = '## 📦 PR Build Artifacts\n\n✅ **Build successful!** Download artifacts:\n\n';
@@ -91,18 +91,20 @@ jobs:
               body += `**arm64** (${sizeMB} MB) - Contains: .deb, .rpm, .tar.gz, .AppImage\n`;
               body += `- [${linuxArm64.name}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId}/artifacts/${linuxArm64.id})\n\n`;
             }
-            if (linuxArmv7l) {
-              const sizeMB = (linuxArmv7l.size_in_bytes / 1024 / 1024).toFixed(2);
-              body += `**armv7l** (${sizeMB} MB) - Contains: .deb, .rpm, .tar.gz, .AppImage\n`;
-              body += `- [${linuxArmv7l.name}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId}/artifacts/${linuxArmv7l.id})\n\n`;
-            }
 
             // macOS section
-            if (macos) {
-              const sizeMB = (macos.size_in_bytes / 1024 / 1024).toFixed(2);
+            if (macosX64 || macosArm64) {
               body += '### 🍎 macOS\n\n';
-              body += `**x86_64** (${sizeMB} MB) - Contains: .dmg\n`;
-              body += `- [${macos.name}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId}/artifacts/${macos.id})\n\n`;
+            }
+            if (macosX64) {
+              const sizeMB = (macosX64.size_in_bytes / 1024 / 1024).toFixed(2);
+              body += `**x86_64 (Intel)** (${sizeMB} MB) - Contains: .dmg\n`;
+              body += `- [${macosX64.name}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId}/artifacts/${macosX64.id})\n\n`;
+            }
+            if (macosArm64) {
+              const sizeMB = (macosArm64.size_in_bytes / 1024 / 1024).toFixed(2);
+              body += `**arm64 (Apple Silicon)** (${sizeMB} MB) - Contains: .dmg\n`;
+              body += `- [${macosArm64.name}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId}/artifacts/${macosArm64.id})\n\n`;
             }
 
             // Windows section
@@ -205,7 +207,6 @@ jobs:
             // Group artifacts by architecture
             const snapX64 = snapArtifacts.find(a => a.name.includes('snap-x64'));
             const snapArm64 = snapArtifacts.find(a => a.name.includes('snap-arm64'));
-            const snapArmv7l = snapArtifacts.find(a => a.name.includes('snap-armv7l'));
 
             let body = '## 📦 PR Snap Build Artifacts\n\n';
             body += '✅ **Snap builds successful!** Download artifacts:\n\n';
@@ -220,11 +221,6 @@ jobs:
               const sizeMB = (snapArm64.size_in_bytes / 1024 / 1024).toFixed(2);
               body += `**arm64** (${sizeMB} MB)\n`;
               body += `- [${snapArm64.name}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId}/artifacts/${snapArm64.id})\n\n`;
-            }
-            if (snapArmv7l) {
-              const sizeMB = (snapArmv7l.size_in_bytes / 1024 / 1024).toFixed(2);
-              body += `**armv7l** (${sizeMB} MB)\n`;
-              body += `- [${snapArmv7l.name}](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId}/artifacts/${snapArmv7l.id})\n\n`;
             }
 
             body += '---\n\n';

@@ -165,6 +165,10 @@ class ExampleModule {
 
 Configuration options are declared in one place, `app/config/options.js`, where each option is an object carrying a `default`, a `describe` string, a `type`, and an `applyMode`. This module is the single source of truth: the generated config reference, the docs-site config explorer, and startup validation are all derived from it. Adding one is a small, self-contained change that follows the shape of the options already there.
 
+### 0. Name the option
+
+New options are always nested; the flat top-level namespace is closed to new additions. Start from an existing namespace: check `docs-site/static/config-schema.json` (or `app/config/options.js`) for an object that already owns your feature area and add your leaf there, creating a new parent only when none fits. Boolean feature gates use positive naming (`enabled`, never `disable*`; narrow platform escape hatches excepted, see ADR-025). [ADR-025](adr/025-config-option-naming-convention.md) is authoritative for the full nesting and naming criteria, and carries the resolved rename table for existing flat options; if your change touches an existing flat option, you are not required to perform its rename in your PR.
+
 ### 1. Declare the option
 
 Add an entry to `app/config/options.js`, following the existing convention:
@@ -310,7 +314,7 @@ When creating or updating any markdown documentation in this project (including 
 :::tip Single Source of Truth
 These markdown standards apply to ALL markdown files in the project:
 - Documentation site (`docs-site/docs/`)
-- Root-level documentation (README, CONTRIBUTING, CLAUDE.md)
+- Root-level documentation (README, CONTRIBUTING, AGENTS.md)
 - Module READMEs in `app/` directories
 
 When updating standards, update this section only. All other files should reference these standards.
@@ -424,7 +428,8 @@ teams-for-linux
 
 - [ ] Code follows style guidelines
 - [ ] `npm run lint` passes without errors
-- [ ] `npm run test:e2e` passes (E2E tests)
+- [ ] `npm run test:unit` passes (unit tests)
+- [ ] `npm run test:e2e` passes locally, or let CI run it (E2E tests)
 - [ ] Manual testing completed
 - [ ] Documentation updated if needed
 - [ ] Commit messages are descriptive
@@ -476,7 +481,7 @@ See [Manual Release Process](manual-release-process.md) for detailed instruction
 ### Development Questions
 
 - **[IPC API Documentation](ipc-api.md)** - Inter-process communication reference
-- **[Configuration Guide](configuration.md)** - Understanding the config system
+- **[Configuration Guide](../configuration.md)** - Understanding the config system
 - **[Architecture Overview](#architecture-overview)** - Main and renderer process layout, key components
 
 ### Community Support
@@ -495,7 +500,7 @@ By contributing to Teams for Linux, you agree that your contributions will be li
 
 ## Related Documentation
 
-- [Configuration Options](configuration.md) - Application configuration reference
+- [Configuration Options](../configuration.md) - Application configuration reference
 - [IPC API](ipc-api.md) - Developer integration documentation
 - [Manual Release Process](manual-release-process.md) - Release workflow using release-please
 - [Release Info Generation](release-info.md) - Technical details of release info script

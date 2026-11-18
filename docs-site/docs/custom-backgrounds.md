@@ -14,7 +14,7 @@ See the [example README](https://github.com/IsmaelMartinez/teams-for-linux/tree/
 
 1. **Enabling the Feature:**  
    To activate custom backgrounds, launch the application with:  
-   `--isCustomBackgroundEnabled=true`
+   `--customBackground.enabled=true`
 
    For Apache2 users, you might need to add a configuration like the following
    in your `/etc/apache2/apache2.conf`:
@@ -35,14 +35,14 @@ See the [example README](https://github.com/IsmaelMartinez/teams-for-linux/tree/
 3. **Configuration Options:**  
    Two configuration options are used for custom backgrounds:
 
-   - `customBGServiceBaseUrl`: The base URL of your web server providing custom
+   - `customBackground.serviceBaseUrl`: The base URL of your web server providing custom
      background images.
-   - `customBGServiceConfigFetchInterval`: The poll interval (in seconds) at
+   - `customBackground.configFetchInterval`: The poll interval (in seconds) at
      which the app fetches background configuration data.
 
 4. **URL Structure for Images:**  
    Custom images are always loaded using the pattern:  
-   `<customBGServiceBaseUrl>/<image-path>`  
+   `<customBackground.serviceBaseUrl>/<image-path>`  
    Make sure your web server is running and that the specified base URL responds
    correctly.
 
@@ -55,7 +55,7 @@ See the [example README](https://github.com/IsmaelMartinez/teams-for-linux/tree/
 
 ### Configuration File Location
 The list of custom images should be stored at:  
-`<customBGServiceBaseUrl>/config.json`
+`<customBackground.serviceBaseUrl>/config.json`
 
 ### Example Configuration File
 The configuration should be a JSON object with a `videoBackgroundImages`
@@ -77,7 +77,7 @@ array. For example:
 
 This JSON array allows you to define any number of images. Replace
 `<path-to-image>` and `<path-to-thumb-image>` with the actual paths relative
-to your `customBGServiceBaseUrl`.
+to your `customBackground.serviceBaseUrl`.
 
 ### Configuration Properties
 
@@ -90,8 +90,8 @@ to your `customBGServiceBaseUrl`.
 | `thumb_src` | Path to the thumbnail image | Use ~280x158 resolution for faster loading |
 
 :::note Path Resolution
-Image paths are relative to `customBGServiceBaseUrl`. For example, if your
-`customBGServiceBaseUrl` is `https://example.com` and your image is at
+Image paths are relative to `customBackground.serviceBaseUrl`. For example, if your
+`customBackground.serviceBaseUrl` is `https://example.com` and your image is at
 `https://example.com/images/sample.jpg`, then `src` would be
 `/evergreen-assets/backgroundimages/images/sample.jpg`.
 :::
@@ -109,7 +109,7 @@ cd /path/to/your/images
 python3 -m http.server 8080
 
 # Configure Teams for Linux
-teams-for-linux --isCustomBackgroundEnabled=true --customBGServiceBaseUrl=http://localhost:8080
+teams-for-linux --customBackground.enabled=true --customBackground.serviceBaseUrl=http://localhost:8080
 ```
 
 #### Using Node.js HTTP Server
@@ -124,7 +124,7 @@ cd /path/to/your/images
 http-server -p 8080 --cors
 
 # Configure Teams for Linux
-teams-for-linux --isCustomBackgroundEnabled=true --customBGServiceBaseUrl=http://localhost:8080
+teams-for-linux --customBackground.enabled=true --customBackground.serviceBaseUrl=http://localhost:8080
 ```
 
 ### Advanced Configuration
@@ -134,9 +134,11 @@ Add to your `~/.config/teams-for-linux/config.json`:
 
 ```json
 {
-  "isCustomBackgroundEnabled": true,
-  "customBGServiceBaseUrl": "http://localhost:8080",
-  "customBGServiceConfigFetchInterval": 300
+  "customBackground": {
+    "enabled": true,
+    "serviceBaseUrl": "http://localhost:8080",
+    "configFetchInterval": 300
+  }
 }
 ```
 
@@ -145,9 +147,11 @@ For corporate environments with existing web infrastructure:
 
 ```json
 {
-  "isCustomBackgroundEnabled": true,
-  "customBGServiceBaseUrl": "https://intranet.company.com/teams-backgrounds",
-  "customBGServiceConfigFetchInterval": 3600
+  "customBackground": {
+    "enabled": true,
+    "serviceBaseUrl": "https://intranet.company.com/teams-backgrounds",
+    "configFetchInterval": 3600
+  }
 }
 ```
 
@@ -157,16 +161,16 @@ For corporate environments with existing web infrastructure:
 
 #### Backgrounds Not Loading
 1. **Check CORS headers**: Ensure your web server includes `Access-Control-Allow-Origin: *`
-2. **Verify URL accessibility**: Test that `<customBGServiceBaseUrl>/config.json` is reachable
+2. **Verify URL accessibility**: Test that `<customBackground.serviceBaseUrl>/config.json` is reachable
 3. **Check image paths**: Ensure image files exist at the specified paths
 
 #### Poor Performance
 1. **Optimize image sizes**: Use recommended resolutions (1920x1080 for full, 280x158 for thumbnails)
-2. **Adjust fetch interval**: Increase `customBGServiceConfigFetchInterval` to reduce server load
+2. **Adjust fetch interval**: Increase `customBackground.configFetchInterval` to reduce server load
 3. **Use local server**: Host images locally for better performance
 
 #### Configuration Not Updating
-1. **Check fetch interval**: Ensure `customBGServiceConfigFetchInterval` is set appropriately
+1. **Check fetch interval**: Ensure `customBackground.configFetchInterval` is set appropriately
 2. **Restart application**: Changes may require restarting Teams for Linux
 3. **Verify JSON syntax**: Validate your config.json file syntax
 
@@ -174,7 +178,7 @@ For corporate environments with existing web infrastructure:
 Enable debug logging to troubleshoot custom background issues:
 
 ```bash
-teams-for-linux --logConfig='{"level":"debug"}' --isCustomBackgroundEnabled=true
+teams-for-linux --logConfig='{"level":"debug"}' --customBackground.enabled=true
 ```
 
 ## Security Considerations

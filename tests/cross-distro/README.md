@@ -92,14 +92,17 @@ APP_FLAGS="--logConfig.transports.console.level=debug" docker compose up --build
 With `--no-launch`, start the app from the terminal inside VNC:
 
 ```bash
-# X11 / XWayland
+# X11 (no flag needed on an X11 session)
 /home/tester/app-local/teams-for-linux.AppImage --appimage-extract-and-run \
     --no-sandbox --disable-gpu --disable-dev-shm-usage
 
-# Wayland (native)
+# XWayland (the AppImage ships no ozone flag, so force X11 on the Wayland session)
 /home/tester/app-local/teams-for-linux.AppImage --appimage-extract-and-run \
-    --no-sandbox --disable-gpu --disable-dev-shm-usage \
-    --enable-features=UseOzonePlatform --ozone-platform=wayland
+    --no-sandbox --disable-gpu --disable-dev-shm-usage --ozone-platform=x11
+
+# Wayland (native): no flag, Chromium picks the Wayland backend from WAYLAND_DISPLAY
+/home/tester/app-local/teams-for-linux.AppImage --appimage-extract-and-run \
+    --no-sandbox --disable-gpu --disable-dev-shm-usage
 ```
 
 ### Apple Silicon (ARM64 Macs)
@@ -141,6 +144,10 @@ docker build --build-arg NODE_VERSION=22.14.0 --build-arg NODE_SHA256=<sha256> \
   -f dockerfiles/ubuntu.Dockerfile .
 ```
 
+The Dockerfiles fetch the tarball with `ADD --checksum`, which requires
+BuildKit (the default builder since Docker 23; on older setups, set
+`DOCKER_BUILDKIT=1`).
+
 ## Electron in Docker
 
 The entrypoint handles these automatically:
@@ -151,7 +158,7 @@ The entrypoint handles these automatically:
 | Shared memory | `--disable-dev-shm-usage`, `shm_size: 2gb` |
 | No namespaces | `--no-sandbox` |
 | Wayland detection | `XDG_SESSION_TYPE` set per display server |
-| Ozone override | AppImage ships `--ozone-platform=x11`; Wayland script overrides to `=wayland` |
+| Ozone override | AppImage ships no flag; the Wayland script launches it as shipped (native Wayland by auto-selection) and the XWayland script passes `--ozone-platform=x11` |
 
 **X11** -- high confidence, mirrors CI exactly (`xvfb-run` + Electron).
 **XWayland** -- high confidence, app sees X11 through Sway's XWayland bridge.
@@ -162,6 +169,15 @@ The entrypoint handles these automatically:
 - **X11:** Xvfb + Openbox + x11vnc + xterm
 - **Wayland:** Sway (headless, XWayland disabled) + wayvnc + foot
 - **XWayland:** Sway (headless, XWayland enabled) + wayvnc + xterm
+
+## Post-auth tests with a saved session
+
+Microsoft's sign-in wall keeps the CI Playwright suite pre-auth. The containers add a second mode that runs tests against a real, persisted session, which is the check to run before an Electron upgrade.
+
+1. `./run.sh ubuntu x11 --login`: starts the container with npm-installed Electron and noVNC, you sign in to Teams in the browser, and `Ctrl+C` saves the session to `./session`.
+2. `./run-all-tests.sh`: for each of the nine distro and display-server configurations, runs `./run.sh <distro> <display> --test`, which mounts the saved session read-only and runs the Playwright specs (app ready, screen sharing, window management), then prints a pass/fail summary. `./run-all-tests.sh --cleanup` removes the session folder.
+
+What the implementation depends on: the session must be created by the same Electron binary that runs the tests (hence the pinned Node.js above), `--password-store=basic` keeps cookies off a D-Bus-bound keyring, `E2E_TESTING=true` bypasses the code-evaluation override in `browserWindowManager.js`, tests wait for `domcontentloaded` because Teams never reaches `networkidle`, and the `desktopCapturer` test is skipped on pure Wayland since it needs an X11 display. Still open: detecting an expired session and prompting for a new login, and whether to store an encrypted session for CI runs or keep this a manual developer workflow.
 
 ## Troubleshooting
 

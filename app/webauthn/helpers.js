@@ -17,7 +17,8 @@ function base64urlEncode(buffer) {
     .toString("base64")
     .replaceAll("+", "-")
     .replaceAll("/", "_")
-    .replace(/=+$/, "");
+    // Bounded: base64 padding is never more than two "=" (S8786).
+    .replace(/={1,2}$/, "");
 }
 
 /**
@@ -39,15 +40,21 @@ function base64urlDecode(str) {
  *
  * @param {string} type - "webauthn.create" or "webauthn.get"
  * @param {Buffer} challengeBytes - Raw challenge bytes
- * @param {string} origin - Origin string (e.g. "https://login.microsoftonline.com")
+ * @param {string} origin - Origin of the frame that called navigator.credentials
+ * @param {string|null} [topOrigin] - Origin of the top-level document, when the
+ *   ceremony ran in a frame. Only differs from `origin` for an iframe ceremony,
+ *   which is what makes it cross-origin.
  * @returns {Buffer}
  */
-function generateClientDataJSON(type, challengeBytes, origin) {
+function generateClientDataJSON(type, challengeBytes, origin, topOrigin = null) {
+  const crossOrigin = Boolean(topOrigin) && topOrigin !== origin;
   const clientData = JSON.stringify({
     type,
     challenge: base64urlEncode(challengeBytes),
     origin,
-    crossOrigin: false,
+    crossOrigin,
+    // topOrigin is defined only for a cross-origin ceremony (WebAuthn L3).
+    ...(crossOrigin ? { topOrigin } : {}),
   });
   return Buffer.from(clientData, "utf-8");
 }
@@ -63,6 +70,7 @@ function generateClientDataJSON(type, challengeBytes, origin) {
  */
 function sanitizeForFido2(value, maxLength = 500) {
   if (typeof value !== "string") return "";
+  // eslint-disable-next-line no-control-regex -- stripping control characters is the point
   return value.replaceAll(/[\x00-\x1f\x7f]/g, "").substring(0, maxLength);
 }
 

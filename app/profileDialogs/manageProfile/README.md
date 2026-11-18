@@ -2,7 +2,10 @@
 
 Modal `BrowserWindow` opened from the **Profiles → Manage…** menu entry
 when `multiAccount.enabled === true`. Lets the user rename existing
-profiles inline and remove them (with native confirmation).
+profiles inline, pin/unpin them for the `Ctrl+Alt+1…5` switch shortcuts
+(max 5 pinned, enforced in `ProfilesManager`), turn each profile's
+notifications and sounds on or off (see `app/profileNotifications/`), and
+remove them (with native confirmation).
 
 ## Files
 
@@ -11,14 +14,16 @@ profiles inline and remove them (with native confirmation).
 | `index.js`           | `ManageProfileDialog` class — owns the BrowserWindow lifecycle and IPC.     |
 | `manageProfile.html` | Markup for the list view + close button.                                    |
 | `manageProfile.css`  | Styling, including dark-mode via `prefers-color-scheme`.                    |
-| `manageProfile.js`   | Renderer-side row rendering, inline rename, remove click handling.          |
-| `preload.js`         | `contextBridge` exposing `manageProfileApi.{rename,remove,close,onState,onError}`. |
+| `manageProfile.js`   | Renderer-side row rendering, inline rename, pin toggle, notification/sound checkboxes, remove click handling. |
+| `preload.js`         | `contextBridge` exposing `manageProfileApi.{rename,pin,setNotificationFlags,remove,close,onState,onError}`. |
 
 ## IPC channels
 
 | Channel                  | Direction         | Mechanism                  | Payload                                          |
 | ------------------------ | ----------------- | -------------------------- | ------------------------------------------------ |
 | `manage-profile-rename`  | renderer → main   | `invoke` / `handle`        | request: profile id and new name; resolves on success, rejects with the validation message on failure |
+| `manage-profile-pin`     | renderer → main   | `invoke` / `handle`        | request: profile id and desired `pinned`; resolves on success, rejects with the max-5-cap message on failure |
+| `manage-profile-notifications` | renderer → main | `invoke` / `handle`   | request: profile id plus `disableNotifications` and/or `muted`; resolves `{ ok }`, or `{ ok: false, error }` on failure |
 | `manage-profile-remove`  | renderer → main   | `send` / `on`              | profile id (main shows the destructive confirmation) |
 | `manage-profile-close`   | renderer → main   | `send` / `on`              | _none_                                           |
 | `manage-profile-state`   | main → renderer   | push                       | profiles list and the active profile id          |

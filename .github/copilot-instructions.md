@@ -5,7 +5,7 @@
 > - **Local Documentation**: See markdown files in `docs-site/docs/` directory (these are the source files)
 > - **Web Documentation**: [Teams for Linux Documentation Site](https://ismaelmartinez.github.io/teams-for-linux/) (for human reference)
 > - **Development Guide**: `docs-site/docs/development/contributing.md` ([web](https://ismaelmartinez.github.io/teams-for-linux/development/contributing))
-> - **Claude Code Instructions**: See `CLAUDE.md` in the root directory for detailed code patterns and AI agent workflows
+> - **AI Agent Instructions**: See `AGENTS.md` in the root directory for detailed code patterns and AI agent workflows
 > - **Markdown Standards**: `docs-site/docs/development/contributing.md` (Markdown Standards section)
 >
 > **Important**: Read documentation from local markdown files in `docs-site/docs/` rather than fetching from the web.
@@ -45,14 +45,19 @@ npm run dist:linux    # Build Linux packages (AppImage, deb, rpm, snap)
 ### Critical Warnings
 
 > [!IMPORTANT]
-> **TrayIconRenderer IPC Initialization** - The `trayIconRenderer` module MUST be included in the IPC initialization list in `app/browser/preload.js`. This has been accidentally removed multiple times in git history. See issue #1902 and CLAUDE.md for details.
+> **TrayIconRenderer IPC Initialization** - The `trayIconRenderer` module MUST be included in the IPC initialization list in `app/browser/preload.js`. This has been accidentally removed multiple times in git history. See issue #1902 and AGENTS.md for details.
 
 ```javascript
-// REQUIRED in app/browser/preload.js
-if (module.name === "settings" || module.name === "theme" || module.name === "trayIconRenderer" || module.name === "mqttStatusMonitor") {
+// REQUIRED in app/browser/preload.js: entries flagged `ipc: true` receive ipcRenderer
+{ name: "trayIconRenderer", path: "./tools/trayIconRenderer", ipc: true },
+{ name: "mqttStatusMonitor", path: "./tools/mqttStatusMonitor", ipc: true },
+// ...
+if (module.ipc === true) {
   moduleInstance.init(config, ipcRenderer);
 }
 ```
+
+The flag lives on each entry and the loop is indexed rather than a `Set` with `for...of`, because page script shares the preload's JavaScript world and can patch `Set.prototype.has` or the array iterator (see ADR-035).
 
 ## Project Architecture
 

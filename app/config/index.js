@@ -5,6 +5,18 @@ const { ipcMain } = require("electron");
 const logger = require("./logger");
 const configOptions = require("./options");
 const { validateConfigFile } = require("./validator");
+const {
+  buildDeprecationWarning,
+  migrationMenuLocation,
+} = require("./deprecation");
+const {
+  applyRenamedOptions,
+  deprecationSources,
+  isOptionSetByUser,
+  readUserSources,
+} = require("./renames");
+const { mergeConfigFiles, applyObjectDefaults } = require("./mergeDefaults");
+const watchedConfigs = new WeakSet();
 
 function getConfigFilePath(configPath) {
   return path.join(configPath, "config.json");
@@ -65,9 +77,11 @@ function populateConfigObjectFromFile(configObject, configPath) {
     }
   }
 
-  // Merge configs with user config taking precedence over system config
+  // Merge configs with user config taking precedence over system config. Deep,
+  // so a user `mqtt` block overrides the admin's leaves rather than the whole
+  // namespace.
   if (hasUserConfig || hasSystemConfig) {
-    configObject.configFile = { ...systemConfig, ...userConfig };
+    configObject.configFile = mergeConfigFiles(systemConfig, userConfig);
     configObject.isConfigFile = true;
 
     if (hasUserConfig && hasSystemConfig) {
@@ -100,25 +114,25 @@ function extractYargConfig(configObject, appVersion) {
   return { yargsInstance, parsedConfig };
 }
 
-function checkUsedDeprecatedValues(yargsInstance, configObject, config) {
+function checkUsedDeprecatedValues(yargsInstance, sources, config) {
   // yargs v18: getDeprecatedOptions() must be called on the instance
-  const deprecatedOptions = yargsInstance.getDeprecatedOptions();
-  const warnings = [];
+  const message = buildDeprecationWarning(
+    yargsInstance.getDeprecatedOptions(),
+    sources,
+    migrationMenuLocation(config)
+  );
+  if (!message) return;
 
-  for (const option in deprecatedOptions) {
-    if (option in configObject.configFile) {
-      const deprecatedWarningMessage = `Option \`${option}\` is deprecated and will be removed in future version. \n ${deprecatedOptions[option]}.`;
-      console.warn(deprecatedWarningMessage);
-      warnings.push(deprecatedWarningMessage);
-    } else {
-      console.debug(`all good with ${option} you aren't using them`);
-    }
-  }
-
-  // Accumulate all warnings instead of overwriting
-  if (warnings.length > 0) {
-    config["warnings"] = warnings;
-  }
+  console.warn(message);
+  // Gate C in #2842: the log alone reaches nobody, since the file transport is
+  // off by default and a desktop launch discards stdout. So the message also
+  // goes to the acknowledge-once Configuration Warning modal
+  // (showConfigurationDialogs in app/index.js). That modal will reach most
+  // customised configs, because keys as common as `url` and `appTitle` are
+  // deprecated; with removal in 2.36.0 that is now the point. It shows once:
+  // the acknowledgement is keyed on a hash of this text, which is why
+  // buildDeprecationWarning keeps it free of values and in a fixed order.
+  config.warnings = [...(config.warnings || []), message];
 }
 
 function argv(configPath, appVersion) {
@@ -138,8 +152,20 @@ function argv(configPath, appVersion) {
     config["error"] = configObject.configError;
   }
 
-  // Pass yargs instance to access getDeprecatedOptions() in v18
-  checkUsedDeprecatedValues(yargsInstance, configObject, config);
+  // yargs replaces an object option wholesale when the file or CLI sets any
+  // leaf; restore the declared defaults of the leaves left unset.
+  applyObjectDefaults(config, configOptions);
+
+  // What the user supplied, per source (command line, environment, config
+  // file). The presence oracle for the projection, the GPU check and the
+  // deprecation warning alike; see app/config/renames.js for why the resolved
+  // config cannot be it.
+  const userArgv = process.argv.slice(1);
+  const sources = readUserSources(configObject.configFile, userArgv);
+
+  // ADR-025: project any nested value the user supplied onto the flat key that
+  // modules still read. Must run before anything consumes the config.
+  applyRenamedOptions(config, sources);
 
   if (configObject.isConfigFile && config.watchConfigFile) {
     fs.watch(getConfigFilePath(configPath), (event, filename) => {
@@ -148,15 +174,35 @@ function argv(configPath, appVersion) {
       );
       ipcMain.emit("config-file-changed");
     });
+    watchedConfigs.add(config);
   }
 
   // Track whether disableGpu was explicitly set via CLI or config file
-  // This allows Wayland detection to use smart defaults while respecting user preferences
-  const wasSetInCli = process.argv.some(arg => arg.startsWith('--disableGpu'));
-  const wasSetInFile = configObject.configFile && "disableGpu" in configObject.configFile;
-  config.disableGpuExplicitlySet = wasSetInCli || wasSetInFile;
+  // This allows Wayland detection to use smart defaults while respecting user preferences.
+  // Counts both names: since ADR-025 the option is also spelled
+  // performance.disableGpu, and missing that spelling would let the Wayland
+  // default overwrite the choice of a user who opted back into the GPU.
+  config.disableGpuExplicitlySet = isOptionSetByUser(sources, "disableGpu");
+
+  // loadMenuToggleSettings in app/index.js re-reads the menu toggles from
+  // config.json at app-ready; it skips these so the command line and the
+  // environment keep beating the file. Names only, never values.
+  config.optionsSetOutsideConfigFile = Object.keys(configOptions).filter((flat) =>
+    isOptionSetByUser(sources, flat, ["cli", "env"])
+  );
 
   logger.init(config.logConfig);
+
+  // Runs after logger.init so the warning reaches the log file too, for the
+  // users who have file logging on; everyone else meets it in the startup
+  // modal. Pass yargs instance to access getDeprecatedOptions() in v18
+  // Chromium switch aliases such as --disable-gpu are permanent and not
+  // reported; see CHROMIUM_SWITCH_ALIASES in app/config/renames.js.
+  checkUsedDeprecatedValues(
+    yargsInstance,
+    deprecationSources(sources, userArgv),
+    config
+  );
 
   // Warn-only schema validation of the merged (system + user) config file
   // contents (issue #2597). Runs after logger.init so warnings reach the log.
@@ -178,3 +224,8 @@ function argv(configPath, appVersion) {
 }
 
 exports = module.exports = argv;
+// Exposed so the menu can open the very file this module reads, without
+// a second copy of the "config.json" literal drifting from this one.
+module.exports.getConfigFilePath = getConfigFilePath;
+// A requested watcher is not necessarily active (e.g. no file at startup).
+module.exports.isWatchingConfigFile = (config) => watchedConfigs.has(config);

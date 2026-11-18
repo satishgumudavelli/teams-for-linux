@@ -1,19 +1,28 @@
 const { ipcMain } = require('electron');
 const NotificationToast = require('./NotificationToast');
+const { resolveToastOptions } = require('./toastOptions');
 
 class CustomNotificationManager {
   #mainWindow;
-  #toastDuration;
+  #toastOptions;
   #activeToasts;
+  // toast → the renderer that raised it, so a click can bring that profile
+  // forward (multi-account).
+  #toastOrigins = new WeakMap();
+  #activateProfile = null;
 
   constructor(config, mainWindow) {
     this.#mainWindow = mainWindow;
-    this.#toastDuration = config?.customNotification?.toastDuration || 5000;
+    this.#toastOptions = resolveToastOptions(config?.customNotification);
     this.#activeToasts = new Set();
   }
 
+  setProfileActivator(activate) {
+    this.#activateProfile = activate;
+  }
+
   initialize() {
-    // Display custom in-app toast notification in bottom-right corner
+    // Display custom in-app toast notification (corner set by customNotification.position)
     ipcMain.on('notification-show-toast', this.#handleShowToast.bind(this));
     // Handle toast clicks - close the window and focus main window
     ipcMain.on('notification-toast-click', this.#handleToastClick.bind(this));
@@ -30,10 +39,11 @@ class CustomNotificationManager {
     try {
       const toast = new NotificationToast(
         data,
-        this.#toastDuration
+        this.#toastOptions
       );
 
       this.#activeToasts.add(toast);
+      this.#toastOrigins.set(toast, event.sender);
 
       // Remove from tracking when toast closes
       const originalClose = toast.close.bind(toast);
@@ -54,6 +64,7 @@ class CustomNotificationManager {
       // Find and close the toast window that was clicked
       for (const toast of this.#activeToasts) {
         if (toast.getWebContents() === event.sender) {
+          this.#activateProfile?.(this.#toastOrigins.get(toast));
           toast.close();
           break;
         }

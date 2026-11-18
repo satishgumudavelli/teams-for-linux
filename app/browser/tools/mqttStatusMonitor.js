@@ -1,3 +1,5 @@
+"use strict";
+
 /**
  * MQTT Status Monitor
  *
@@ -8,7 +10,7 @@
  * because Teams' React internals don't expose presence services and the
  * Graph API /me/presence endpoint returns 403 (Teams token lacks Presence.Read
  * scope). When Microsoft changes their DOM structure, selectors will break.
- * See: docs-site/docs/development/research/graph-api-integration-research.md
+ * See: docs-site/docs/development/adr/030-graph-api-teams-session-token.md
  *
  * Status Detection Strategy:
  * 1. CSS selectors targeting known Teams presence elements
@@ -22,9 +24,12 @@
  */
 
 class MQTTStatusMonitor {
+	// Private: anything on `this` is reachable from page script (GHSA-58j7-22f8-6xqp).
+	#ipcRenderer = null;
+
 	init(config, ipcRenderer) {
 		this.config = config;
-		this.ipcRenderer = ipcRenderer;
+		this.#ipcRenderer = ipcRenderer;
 		this.lastStatus = null;
 		this.observer = null;
 		this.pollInterval = null;
@@ -40,11 +45,13 @@ class MQTTStatusMonitor {
 			{ keywords: ['available', 'online', 'green', 'presence-available', 'status-available'], code: 1 }
 		];
 
-		// Only start monitoring if MQTT is enabled or the macOS dock-icon
-		// status overlay needs the local status events
-		const dockIconWantsStatus =
-			config.media?.showStatusOnDockIcon && process.platform === 'darwin';
-		if (!config.mqtt?.enabled && !dockIconWantsStatus) {
+		// D-Bus status observation is explicitly opt-in, independently of MQTT.
+		const dbusEnabled = process.platform === 'linux' && config.dbusControl?.enabled === true;
+		// media.showStatusOnDockIcon asks for the presence overlay: the Dock on
+		// macOS, the tray icon on the platforms that have no Dock. Either way
+		// the monitor has to run, so there is no platform test here.
+		const statusOverlayWanted = config.media?.showStatusOnDockIcon === true;
+		if (!config.mqtt?.enabled && !dbusEnabled && !statusOverlayWanted) {
 			console.debug('Status monitoring disabled');
 			return;
 		}
@@ -53,11 +60,7 @@ class MQTTStatusMonitor {
 		this.start();
 	}
 
-	/**
-	 * Start monitoring Teams status
-	 */
 	start() {
-		// Wait for DOM to be ready
 		if (document.readyState === 'loading') {
 			document.addEventListener('DOMContentLoaded', () => this.startMonitoring());
 		} else {
@@ -66,19 +69,11 @@ class MQTTStatusMonitor {
 		}
 	}
 
-	/**
-	 * Begin active monitoring with both observer and polling
-	 */
 	startMonitoring() {
 		console.debug('Starting Teams status monitoring for MQTT');
 
-		// Set up mutation observer for reactive updates
 		this.setupMutationObserver();
-
-		// Set up polling as fallback
 		this.startPolling();
-
-		// Perform initial status check
 		this.checkStatusChange();
 	}
 
@@ -108,9 +103,6 @@ class MQTTStatusMonitor {
 		console.debug('Mutation observer set up for status monitoring (with 300ms debounce)');
 	}
 
-	/**
-	 * Start polling for status changes as fallback
-	 */
 	startPolling() {
 		const interval = this.config.mqtt?.statusCheckInterval || 10000;
 
@@ -121,21 +113,16 @@ class MQTTStatusMonitor {
 		console.debug(`Status polling started with ${interval}ms interval`);
 	}
 
-	/**
-	 * Check if status has changed and notify main process
-	 */
 	checkStatusChange() {
 		try {
 			const status = this.detectCurrentStatus();
 
-			// Only send IPC if status actually changed
 			if (status !== null && status !== this.lastStatus) {
 				console.debug(`Teams status changed: ${this.lastStatus} -> ${status}`);
 				this.lastStatus = status;
 
-				// Send status change to main process (MQTT publishing only)
-				if (this.config.mqtt?.enabled) {
-					this.ipcRenderer.invoke('user-status-changed', {
+				if (this.config.mqtt?.enabled || (process.platform === 'linux' && this.config.dbusControl?.enabled === true)) {
+					this.#ipcRenderer.invoke('user-status-changed', {
 						data: { status: status }
 					});
 				}
@@ -212,11 +199,6 @@ class MQTTStatusMonitor {
 		return this._findStatusFromElements(selectors);
 	}
 
-	/**
-	 * Find status by querying DOM selectors in order
-	 * @param {string[]} selectors - CSS selectors to query
-	 * @returns {number|null} Status code or null if not detected
-	 */
 	_findStatusFromElements(selectors) {
 		for (const selector of selectors) {
 			const element = document.querySelector(selector);
@@ -230,10 +212,6 @@ class MQTTStatusMonitor {
 		return null;
 	}
 
-	/**
-	 * Detect status from me-control avatar button
-	 * @returns {number|null} Status code or null if not detected
-	 */
 	detectStatusFromMeControl() {
 		// Try both current and older data-tid values
 		const meControl = document.querySelector('[data-tid="me-control-avatar-trigger"]') ||
@@ -264,10 +242,6 @@ class MQTTStatusMonitor {
 		return null;
 	}
 
-	/**
-	 * Extract status from a DOM element
-	 * Checks class names, aria-label, title, and other attributes for status indicators
-	 */
 	extractStatusFromElement(element) {
 		const classList = element.classList.toString();
 		const ariaLabel = element.getAttribute('aria-label') || '';
@@ -291,9 +265,6 @@ class MQTTStatusMonitor {
 		return this.mapTextToStatusCode(classList, ariaLabel, title, textContent, dataTestId, dataTid, style, fill, childPresenceInfo);
 	}
 
-	/**
-	 * Extract status from page title
-	 */
 	extractStatusFromPageTitle() {
 		return this.mapTextToStatusCode(document.title);
 	}
@@ -305,7 +276,6 @@ class MQTTStatusMonitor {
 	mapTextToStatusCode(...textSources) {
 		const combinedText = textSources.join(' ').toLowerCase();
 
-		// Check each status keyword group in priority order
 		for (const statusGroup of this.statusKeywords) {
 			for (const keyword of statusGroup.keywords) {
 				if (combinedText.includes(keyword)) {
@@ -317,9 +287,6 @@ class MQTTStatusMonitor {
 		return null;
 	}
 
-	/**
-	 * Stop monitoring
-	 */
 	stop() {
 		if (this.observer) {
 			this.observer.disconnect();

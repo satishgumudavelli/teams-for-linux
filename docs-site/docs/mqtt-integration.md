@@ -118,6 +118,8 @@ The media state topic names (relative to `topicPrefix`) can be customized via `m
     "mediaTopics": {
       "inCall": "in-call",
       "incomingCall": "incoming-call",
+      "incomingCallCaller": "incoming-call/caller",
+      "meetingStarted": "meeting-started",
       "camera": "camera",
       "microphone": "microphone",
       "microphoneControl": "microphone/control",
@@ -129,7 +131,7 @@ The media state topic names (relative to `topicPrefix`) can be customized via `m
 
 All keys are optional; omitted keys fall back to the defaults shown above. [Home Assistant discovery](#home-assistant-auto-discovery) configurations automatically use the customized topic names.
 
-> **Note:** `microphoneControl` tracks `microphone` by default — if you set `microphone` but omit `microphoneControl`, the control topic becomes `<microphone>/control` (e.g. `microphone: "mic"` → `mic/control`), so the two stay in sync. Set `microphoneControl` explicitly to decouple it.
+> **Note:** `incomingCallCaller` tracks `incomingCall` the same way, defaulting to `<incomingCall>/caller`. `microphoneControl` tracks `microphone` by default — if you set `microphone` but omit `microphoneControl`, the control topic becomes `<microphone>/control` (e.g. `microphone: "mic"` → `mic/control`), so the two stay in sync. Set `microphoneControl` explicitly to decouple it.
 
 ### Broker URL Formats
 
@@ -196,6 +198,7 @@ Send commands as JSON messages to the command topic (`teams/command` by default)
 | `unmute` | Ctrl+Shift+M | Unmute the microphone (state-aware, see below) |
 | `toggle-video` | Ctrl+Shift+O | Toggle video on/off |
 | `toggle-hand-raise` | Ctrl+Shift+K | Toggle hand raise in meeting |
+| `leave` | Ctrl+Shift+H | Leave/hang up the active call |
 
 ### State-Aware Mute and Unmute
 
@@ -224,6 +227,9 @@ mosquitto_pub -h localhost -t "teams/command" -m '{"action":"toggle-video"}' -q 
 
 # Toggle hand raise
 mosquitto_pub -h localhost -t "teams/command" -m '{"action":"toggle-hand-raise"}' -q 1
+
+# Leave call
+mosquitto_pub -h localhost -t "teams/command" -m '{"action":"leave"}' -q 1
 ```
 
 #### System Keyboard Shortcuts
@@ -298,6 +304,8 @@ The `get-calendar` command retrieves calendar events for a specified date range:
 - `endDate`: ISO 8601 datetime string (end of date range)
 
 **Response Topic:** `teams/calendar`
+
+All events in the range are returned: Graph API results are paged, and Teams for Linux follows the paging links and merges every page into one `value` array (capped at 50 pages; if the cap is hit, the response keeps the remaining `@odata.nextLink` to show it is incomplete).
 
 ### Calendar Response Format
 
@@ -394,9 +402,9 @@ Use `jq` to format the JSON output for better readability. Install with `apt-get
 - Check Microsoft 365 permissions for your account
 - Verify Graph API scopes are granted (Calendars.Read)
 
-**Related Research:**
+**Related:**
 
-- [Graph API Integration](development/research/graph-api-integration-research.md)
+- [Graph API Integration](development/adr/030-graph-api-teams-session-token.md)
 
 ## Published Topics
 
@@ -408,18 +416,103 @@ When MQTT is enabled, Teams for Linux automatically publishes to the following r
 | `{topicPrefix}/{statusTopic}` | JSON object | User presence status (see [Message Format](#message-format) above) |
 | `{topicPrefix}/in-call` | `"true"` or `"false"` | Active call state via IPC events and WebRTC fallback |
 | `{topicPrefix}/incoming-call` | `"true"` or `"false"` | Incoming call ringing state |
+| `{topicPrefix}/incoming-call/caller` | JSON object | Caller of the ringing call; not retained, requires [`mqtt.incomingCallCaller.enabled`](#incoming-call-caller) |
+| `{topicPrefix}/meeting-started` | `"true"` or `"false"` | Scheduled-meeting-start pulse (experimental, requires [`mqtt.meetingStartDetection.enabled`](#meeting-start-detection-experimental)) |
 | `{topicPrefix}/camera` | `"true"` or `"false"` | Camera on/off state |
 | `{topicPrefix}/microphone` | `"speaking"`, `"silent"`, `"muted"`, or `"off"` | Microphone state from WebRTC speaking-indicator monitoring |
 | `{topicPrefix}/microphone/control` | `"muted"`, `"unmuted"`, or `"off"` | Simplified mute state derived from the microphone state; drives the [`mute`/`unmute` command guard](#state-aware-mute-and-unmute) |
 | `{topicPrefix}/screen-sharing` | `"true"` or `"false"` | Screen sharing active state |
 
-The media topic names after the prefix (`in-call`, `incoming-call`, `camera`, `microphone`, `microphone/control`, `screen-sharing`) are defaults and can be customized via [`mqtt.mediaTopics`](#media-topics).
+The media topic names after the prefix (`in-call`, `incoming-call`, `incoming-call/caller`, `meeting-started`, `camera`, `microphone`, `microphone/control`, `screen-sharing`) are defaults and can be customized via [`mqtt.mediaTopics`](#media-topics).
 
-All topics use retained messages so subscribers receive the last known state immediately on connect. The `connected` topic uses LWT: if the app crashes or loses network, the broker publishes `"false"` automatically.
+All topics except `incoming-call/caller` use retained messages so subscribers receive the last known state immediately on connect. The `connected` topic uses LWT: if the app crashes or loses network, the broker publishes `"false"` automatically.
 
-The microphone topic activates whenever `mqtt.enabled` is true (no separate toggle). States are derived from WebRTC `RTCPeerConnection.getStats()`: `speaking` means audio is being transmitted, `silent` means the mic is open but quiet, `muted` means Teams has zeroed the audio signal, and `off` means no active call.
+The microphone topic activates whenever `mqtt.enabled` is true (no separate toggle). States are derived from WebRTC `RTCPeerConnection.getStats()`: `speaking` means audio is being transmitted, `silent` means the mic is open but quiet, `muted` means the outgoing audio sender stopped sending (its track is disabled, muted, ended or detached, its encoding is paused, or its negotiated direction no longer sends) or Teams has zeroed the audio signal, and `off` means no active call. When the sender shows none of these, a zeroed signal is taken as muted, so a microphone with built-in noise reduction that outputs silence while you are quiet also reports `muted` after about half a second.
 
 The camera topic monitors video sender `track.enabled` in the same RTCPeerConnection poll loop used for microphone detection, filtering out screen-sharing tracks via `displaySurface`.
+
+### Incoming Call Caller
+
+This topic is off by default, since it sends the names and numbers of the people who call you (colleagues on Teams as well as outside callers) to the broker. Turn it on with:
+
+```json
+{
+  "mqtt": {
+    "incomingCallCaller": {
+      "enabled": true
+    }
+  }
+}
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `incomingCallCaller.enabled` | `boolean` | `false` | Publish the ringing call's caller to `{topicPrefix}/incoming-call/caller` |
+
+While a call is ringing, `{topicPrefix}/incoming-call/caller` then holds a JSON object saying who is calling:
+
+```json
+{
+  "scenario": "incoming_call_queue_call",
+  "number": "+1 555-010-0001",
+  "name": "Pat Example",
+  "queue": "Support Queue",
+  "contact": true,
+  "callId": "00000000-0000-0000-0000-000000000000",
+  "timestamp": "2026-09-27T19:07:09.834Z",
+  "clientId": "teams-for-linux"
+}
+```
+
+| Field | Present | Meaning |
+|-------|---------|---------|
+| `scenario` | always | Teams' name for the kind of call: `incoming_call` (from a Teams user), `incoming_pstn_call` (from a phone number), `incoming_call_queue_call` or `conference_incoming_call_queue_call` (through a call queue) |
+| `number` | caller has a phone number | The caller's number as Teams formats it |
+| `name` | Teams knows the caller | The caller's name |
+| `queue` | call-queue calls | The call queue the call came in through |
+| `contact` | Teams has judged the caller | `true` when the caller is one of your contacts |
+| `callId` | when Teams gives one | Teams' identifier for the call |
+| `timestamp` | always | When this was published, in ISO 8601, as on the status topic |
+| `clientId` | always | The configured `mqtt.clientId`, as on the status topic |
+
+The caller is published just before `incoming-call` goes `"true"`, so an automation triggered by the ring has it already. Unlike the other topics it is **not retained**: it describes a call that is ringing now, and a retained copy could outlive the call if the app quit or lost the broker mid-ring. A subscriber that connects while a call is already ringing therefore sees `incoming-call` as `"true"` but no caller until Teams announces the call again. There is nothing to clear when the ringing stops; `incoming-call` going `"false"` says so.
+
+A call-queue call in conference mode is announced twice while it rings. The first announcement can come before Teams has matched the caller, in which case `name` is missing and `queue` holds Teams' placeholder (`"Unknown user"` in English) rather than the queue's name; the second, a moment later, carries both. Nothing in the first announcement reliably tells the placeholder apart from a real queue name, so it is published as Teams gives it.
+
+The caller's details are never written to the log.
+
+## Meeting Start Detection (Experimental)
+
+When a scheduled meeting starts, Teams shows a "Meeting Started" banner (and a toast when someone explicitly starts it). Teams for Linux detects this primarily through Teams' internal command stream, which carries the banner as structured, locale-independent data, with a DOM text-match fallback, and publishes a pulse to `{topicPrefix}/meeting-started`: `"true"` on detection, back to `"false"` on whichever comes first, joining the call or `resetSeconds` elapsing. This lets Home Assistant automations fire when a scheduled meeting actually becomes active, not just when it was scheduled (issue [#2587](https://github.com/IsmaelMartinez/teams-for-linux/issues/2587)).
+
+The feature is off by default. Enable it alongside MQTT:
+
+```json
+{
+  "mqtt": {
+    "enabled": true,
+    "brokerUrl": "mqtt://192.168.1.100:1883",
+    "meetingStartDetection": {
+      "enabled": true,
+      "patterns": ["meeting started", "started the meeting"],
+      "resetSeconds": 10
+    }
+  }
+}
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `meetingStartDetection.enabled` | `boolean` | `false` | Enable toast detection and the `meeting-started` topic |
+| `meetingStartDetection.patterns` | `string[]` | `["meeting started", "started the meeting"]` | Case-insensitive regular expressions for the DOM fallback path |
+| `meetingStartDetection.resetSeconds` | `number` | `10` | Seconds before the topic resets to `"false"` if you never join. Joining resets it immediately |
+
+**Known limitations:**
+
+- **Best-effort and fragile.** Detection relies on matching the toast text in the Teams UI. Microsoft can reword the toast or restructure the DOM at any time, which silently breaks detection until patterns are updated.
+- **English-only default.** The default pattern only matches the English toast. If your Teams UI runs in another language, set `patterns` to the wording your locale uses, for example `"hat die Besprechung gestartet"` for German. Patterns are compiled as case-insensitive regular expressions.
+- **No end signal.** Teams provides nothing when the meeting ends, so the topic is a momentary pulse rather than a persistent state.
+- **Privacy.** The toast text contains the name of the person who started the meeting. It is never logged and never published; only the detection event itself reaches MQTT.
 
 ## Home Assistant Auto-Discovery
 
@@ -460,11 +553,13 @@ All entities are grouped under a single HA device (identified by `mqtt.clientId`
 | `sensor` | Teams Microphone | `{topicPrefix}/microphone` | Microphone state (speaking, silent, muted, off) |
 | `binary_sensor` | Teams In Call | `{topicPrefix}/in-call` | Whether you are in an active call |
 | `binary_sensor` | Teams Incoming Call | `{topicPrefix}/incoming-call` | Whether a call is ringing |
+| `binary_sensor` | Teams Meeting Started | `{topicPrefix}/meeting-started` | Pulses on when a scheduled-meeting-start toast is detected (see [Meeting Start Detection](#meeting-start-detection-experimental)) |
 | `binary_sensor` | Teams Screen Sharing | `{topicPrefix}/screen-sharing` | Whether screen sharing is active |
 | `binary_sensor` | Teams Camera | `{topicPrefix}/camera` | Whether the camera is on |
 | `button` | Teams Toggle Mute | via `commandTopic` | Sends `{"action":"toggle-mute"}` |
 | `button` | Teams Toggle Video | via `commandTopic` | Sends `{"action":"toggle-video"}` |
 | `button` | Teams Toggle Hand Raise | via `commandTopic` | Sends `{"action":"toggle-hand-raise"}` |
+| `button` | Teams Leave Call | via `commandTopic` | Sends `{"action":"leave"}` |
 
 Button entities are only created when `commandTopic` is set (bidirectional mode). Discovery configs are republished on every broker reconnect so entities survive broker restarts.
 
@@ -735,6 +830,7 @@ Commands are validated with multiple security layers:
   - `toggle-mute` → Ctrl+Shift+M
   - `toggle-video` → Ctrl+Shift+O
   - `toggle-hand-raise` → Ctrl+Shift+K
+  - `leave` → Ctrl+Shift+H
 - Sends keyboard events to Teams window via `sendKeyboardEventToWindow`
 - **Location**: `app/globalShortcuts/index.js` for keyboard event generation
 

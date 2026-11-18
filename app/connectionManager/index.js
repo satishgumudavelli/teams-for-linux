@@ -1,5 +1,8 @@
 const { ipcMain, net, powerMonitor } = require("electron");
 
+// Debounce window for rapid network change events before refreshing
+const REFRESH_DEBOUNCE_MS = 1000;
+
 let _ConnectionManager_window = new WeakMap();
 let _ConnectionManager_config = new WeakMap();
 let _ConnectionManager_currentUrl = new WeakMap();
@@ -7,8 +10,18 @@ let _ConnectionManager_isRefreshing = new WeakMap();
 let _ConnectionManager_refreshTimeout = new WeakMap();
 let _ConnectionManager_boundRefresh = new WeakMap();
 let _ConnectionManager_boundDidFailLoad = new WeakMap();
+// Set by a main-frame network failure; cleared when refresh() attempts a load.
+// While unset, a page that is already loaded is left alone: Teams keeps
+// working from its local cache when the network drops, and a suspend/resume
+// no longer replaces a healthy page with a blank one (#2611).
+let _ConnectionManager_needsReload = new WeakMap();
 
 class ConnectionManager {
+  // Set once service workers have been cleared after an ERR_FAILED, so a failure
+  // that has some other cause cannot clear them on every retry. Not reset by
+  // start(): one clear per run is enough to replace a broken worker.
+  #clearedServiceWorkers = false;
+
   get window() {
     return _ConnectionManager_window.get(this);
   }
@@ -31,6 +44,7 @@ class ConnectionManager {
     _ConnectionManager_currentUrl.set(this, url || this.config.url);
     _ConnectionManager_isRefreshing.set(this, false);
     _ConnectionManager_refreshTimeout.set(this, null);
+    _ConnectionManager_needsReload.set(this, false);
 
     // Bind methods to preserve 'this' context
     const boundRefresh = this.debouncedRefresh.bind(this);
@@ -68,17 +82,15 @@ class ConnectionManager {
   }
 
   debouncedRefresh() {
-    // Clear any existing timeout
     const existingTimeout = _ConnectionManager_refreshTimeout.get(this);
     if (existingTimeout) {
       clearTimeout(existingTimeout);
     }
 
-    // Set a new timeout to debounce rapid network change events
     const timeout = setTimeout(() => {
       _ConnectionManager_refreshTimeout.set(this, null);
       this.refresh();
-    }, 1000); // Wait 1 second before actually refreshing
+    }, REFRESH_DEBOUNCE_MS);
 
     _ConnectionManager_refreshTimeout.set(this, timeout);
   }
@@ -87,7 +99,9 @@ class ConnectionManager {
     return this.window && !this.window.isDestroyed();
   }
 
-  async refresh() {
+  // `force` is for an explicit user reload (menu, Ctrl+R): it bypasses the
+  // healthy-page check below.
+  async refresh(force = false) {
     if (!this.isWindowAvailable()) {
       console.warn("Window is not available. Cannot refresh.");
       return;
@@ -105,8 +119,15 @@ class ConnectionManager {
 
       const currentUrl = this.window?.webContents?.getURL() || "";
       const hasUrl = currentUrl?.startsWith("https://");
+      if (hasUrl && !force && !_ConnectionManager_needsReload.get(this)) {
+        console.debug("[CONNECTION] Page is loaded and healthy, skipping reload");
+        return;
+      }
       this.window?.setTitle("Waiting for network...");
       console.debug("Waiting for network...");
+      // Timed so a "network never came up" wait is visible at info/error level.
+      const waitStartedAt = Date.now();
+      const waitedSeconds = () => ((Date.now() - waitStartedAt) / 1000).toFixed(1);
       const connected = await this.isOnline();
 
       // Re-check window availability after async isOnline() call,
@@ -116,33 +137,70 @@ class ConnectionManager {
         return;
       }
 
-      if (connected) {
-        if (hasUrl) {
-          console.debug("Reloading current page...");
-          try {
-            this.window.reload();
-          } catch (err) {
-            console.error(`[CONNECTION] Failed to reload page: ${err.message}`);
-            this.debouncedRefresh();
-          }
-        } else {
-          console.debug("Loading initial URL...");
-          try {
-            await this.window.loadURL(this.currentUrl, {
-              userAgent: this.config.chromeUserAgent,
-            });
-          } catch (err) {
-            console.error(`[CONNECTION] Failed to load URL: ${err.message}`);
-            this.debouncedRefresh();
-          }
-        }
-      } else {
+      if (!connected) {
+        // needsReload is left as it was, so a later resume or retry still
+        // reloads a page that failed.
         this.window?.setTitle("No internet connection");
-        console.error("No internet connection");
+        console.error(`[CONNECTION] No internet connection after ${waitedSeconds()}s`);
+        return;
       }
+
+      _ConnectionManager_needsReload.set(this, false);
+      await this.load(hasUrl);
     } finally {
       _ConnectionManager_isRefreshing.set(this, false);
     }
+  }
+
+  async load(hasUrl) {
+    // Timed so the default log shows how long Teams took to load on a slow link.
+    const startedAt = Date.now();
+    const elapsedSeconds = () => ((Date.now() - startedAt) / 1000).toFixed(1);
+    try {
+      if (hasUrl) {
+        console.debug("Reloading current page...");
+        this.window.reload();
+      } else {
+        console.info("[CONNECTION] Loading initial URL...");
+        await this.window.loadURL(this.currentUrl, {
+          userAgent: this.config.chromeUserAgent,
+        });
+        // Navigation time only — lazy chunks can still be loading after this.
+        console.info(`[CONNECTION] Teams navigation finished in ${elapsedSeconds()}s`);
+      }
+    } catch (err) {
+      // Teams' launcher page (msteams:// call and chat links) redirects in the
+      // page, which rejects loadURL with ERR_ABORTED although the new page is
+      // loading. Retrying would reload over the redirect, dropping the link and
+      // leaving "Waiting for network..." as the title (#3152).
+      if (err.code === "ERR_ABORTED") {
+        console.info(`[CONNECTION] Teams redirected the initial load after ${elapsedSeconds()}s`);
+        return;
+      }
+      console.error(`[CONNECTION] Failed to load page after ${elapsedSeconds()}s: ${err.message}`);
+      _ConnectionManager_needsReload.set(this, true);
+      this.debouncedRefresh();
+    }
+  }
+
+  // A service worker saved by an earlier Teams session intercepts every
+  // navigation, so when it breaks, each load and reload fails with the generic
+  // ERR_FAILED and retrying only hands the request back to the same worker.
+  // Unregistering the workers once lets the next load reach the network, and
+  // Teams registers a fresh worker after it loads. Cookies, IndexedDB and local
+  // storage are kept, so the user stays signed in.
+  async clearServiceWorkersAndRetry() {
+    if (this.#clearedServiceWorkers) return;
+    this.#clearedServiceWorkers = true;
+    console.warn("[CONNECTION] Main frame failed with ERR_FAILED; clearing service workers and retrying");
+    try {
+      await this.window.webContents.session.clearStorageData({ storages: ["serviceworkers"] });
+    } catch (err) {
+      console.error(`[CONNECTION] Failed to clear service workers: ${err.message}`);
+      return;
+    }
+    _ConnectionManager_needsReload.set(this, true);
+    this.debouncedRefresh();
   }
 
   async isOnline() {
@@ -151,8 +209,8 @@ class ConnectionManager {
         // Perform an actual HTTPS request, similar to loading the Teams app.
         method: "https",
         tries: 10,
-        networkTest: async () => {
-          return await isOnlineHttps(this.config.url);
+        networkTest: async (timeoutMs) => {
+          return await isOnlineHttps(this.config.url, timeoutMs);
         },
       },
       {
@@ -160,9 +218,9 @@ class ConnectionManager {
         // mandatory but not reachable yet.
         method: "dns",
         tries: 5,
-        networkTest: async () => {
+        networkTest: async (timeoutMs) => {
           const testDomain = new URL(this.config.url).hostname;
-          return await isOnlineDns(testDomain);
+          return await isOnlineDns(testDomain, timeoutMs);
         },
       },
       {
@@ -187,13 +245,27 @@ class ConnectionManager {
       },
     ];
 
+    const deadline = Date.now() + ONLINE_CHECK_BUDGET_MS;
     for (const onlineCheckMethod of onlineCheckMethods) {
       for (let i = 1; i <= onlineCheckMethod.tries; i++) {
-        const online = await onlineCheckMethod.networkTest();
+        // Checking the budget before each probe rather than after it also
+        // catches a deadline that passed during the retry sleep, and clamping
+        // the probe to what is left stops a single hung probe from running past
+        // the budget by up to PROBE_TIMEOUT_MS.
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) {
+          console.warn(
+            `[CONNECTION] Connectivity check exceeded ${ONLINE_CHECK_BUDGET_MS}ms, assuming online`,
+          );
+          return true;
+        }
+        const online = await onlineCheckMethod.networkTest(
+          Math.min(PROBE_TIMEOUT_MS, remainingMs),
+        );
         if (online) {
           return true;
         }
-        await sleep(500);
+        await sleep(RETRY_SLEEP_MS);
       }
     }
     return false;
@@ -212,7 +284,10 @@ function assignOnDidFailLoadEventHandler(cm) {
       console.error(`[CONNECTION] Main frame failed to load: ${description} (code: ${code})`);
       if (RECOVERABLE_NETWORK_ERRORS.has(description)) {
         console.debug(`Network error detected: ${description}, scheduling debounced refresh...`);
+        _ConnectionManager_needsReload.set(cm, true);
         cm.debouncedRefresh();
+      } else if (description === "ERR_FAILED") {
+        void cm.clearServiceWorkersAndRetry();
       }
     } else {
       // Sub-frame failures are expected in restricted networks (e.g. Teams
@@ -237,15 +312,32 @@ function sleep(timeout) {
 // to the next method (and the retry loop gives a recovering network time).
 const PROBE_TIMEOUT_MS = 5000;
 
+// PROBE_TIMEOUT_MS bounds one probe; this bounds the whole sweep. The tries in
+// the isOnline() table add up to 20 probes, so when every probe hangs to its
+// timeout the user watches "Waiting for network..." for about 85 seconds before
+// the escape gate gives up and assumes online. Probes that fail fast (no route,
+// connection refused) only cost the 500ms retry sleep, totalling ~10s, so a
+// 20 second budget leaves the ordinary offline path untouched and only clips the
+// hung-socket case from #2611. Nothing is lost by stopping early: the escape
+// gate at the end of the table assumes online regardless, so the sweep loads the
+// page and did-fail-load schedules a retry if the network really is still down.
+// isOnline() checks this before each probe and clamps the probe to whatever is
+// left, so the sweep settles within the budget plus at most one retry sleep.
+const ONLINE_CHECK_BUDGET_MS = 20000;
+
+// Pause between tries, giving a recovering network time to come back.
+const RETRY_SLEEP_MS = 500;
+
 // Bound a connectivity probe so it always settles. run(finish) performs the
 // probe and calls the idempotent finish(true|false) when it resolves; finish
-// also clears the timeout. If the probe has not settled within PROBE_TIMEOUT_MS,
+// also clears the timeout. If the probe has not settled within timeoutMs
+// (PROBE_TIMEOUT_MS unless isOnline() has less budget than that left),
 // the optional cleanup returned by run() runs (e.g. abort an in-flight request)
 // and the probe resolves false. A synchronous throw from run() (net.request on a
 // malformed URL, a net-stack init failure) is treated as offline, so the probe
 // always resolves a boolean and isOnline() falls through rather than rejecting
 // and wedging refresh().
-function probeWithTimeout(run) {
+function probeWithTimeout(run, timeoutMs = PROBE_TIMEOUT_MS) {
   return new Promise((resolve) => {
     let settled = false;
     let timer;
@@ -263,7 +355,7 @@ function probeWithTimeout(run) {
         /* nothing to clean up, or request already settled */
       }
       finish(false);
-    }, PROBE_TIMEOUT_MS);
+    }, timeoutMs);
     try {
       cleanup = run(finish);
     } catch {
@@ -272,7 +364,7 @@ function probeWithTimeout(run) {
   });
 }
 
-function isOnlineHttps(testUrl) {
+function isOnlineHttps(testUrl, timeoutMs) {
   return probeWithTimeout((finish) => {
     const req = net.request({ url: testUrl, method: "HEAD" });
     req.on("response", () => finish(true));
@@ -280,16 +372,16 @@ function isOnlineHttps(testUrl) {
     req.end();
     // On timeout, abort the in-flight request before resolving false.
     return () => req.abort();
-  });
+  }, timeoutMs);
 }
 
-function isOnlineDns(testDomain) {
+function isOnlineDns(testDomain, timeoutMs) {
   return probeWithTimeout((finish) => {
     net
       .resolveHost(testDomain)
       .then(() => finish(true))
       .catch(() => finish(false));
-  });
+  }, timeoutMs);
 }
 
 module.exports = ConnectionManager;

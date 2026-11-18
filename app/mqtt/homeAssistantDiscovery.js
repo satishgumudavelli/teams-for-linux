@@ -6,8 +6,8 @@
  *
  * Entities created:
  * - sensor:        Teams presence status (plain text), Microphone state
- * - binary_sensor: In-Call, Incoming Call, Screen Sharing, Camera
- * - button:        Toggle Mute, Toggle Video, Toggle Hand Raise (requires commandTopic)
+ * - binary_sensor: In-Call, Incoming Call, Meeting Started, Screen Sharing, Camera
+ * - button:        Leave, Toggle Mute, Toggle Video, Toggle Hand Raise (requires commandTopic)
  *
  * Buttons use payload_press with the pre-built JSON command.
  *
@@ -141,6 +141,11 @@ class HomeAssistantDiscovery {
 				config: this.#buildBinarySensorConfig('Teams Incoming Call', 'incoming_call', this.#mediaTopics.incomingCall, 'mdi:phone-ring')
 			},
 			{
+				component: 'binary_sensor',
+				objectId: 'meeting_started',
+				config: this.#buildBinarySensorConfig('Teams Meeting Started', 'meeting_started', this.#mediaTopics.meetingStarted, 'mdi:calendar-clock')
+			},
+			{
 				component: 'button',
 				objectId: 'toggle_mute',
 				config: this.#buildButtonConfig('Teams Toggle Mute', 'toggle_mute', 'toggle-mute', 'mdi:microphone')
@@ -154,6 +159,11 @@ class HomeAssistantDiscovery {
 				component: 'button',
 				objectId: 'toggle_hand_raise',
 				config: this.#buildButtonConfig('Teams Toggle Hand Raise', 'toggle_hand_raise', 'toggle-hand-raise', 'mdi:hand-back-left')
+			},
+			{
+				component: 'button',
+				objectId: 'leave',
+				config: this.#buildButtonConfig('Teams Leave Call', 'leave', 'leave', 'mdi:phone-hangup')
 			},
 		];
 

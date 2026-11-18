@@ -10,11 +10,13 @@ Development and build commands, run from the repository root:
 |---------|--------------|
 | `npm start` | Run the app in development mode (with `--trace-warnings`) |
 | `npm run lint` | Run ESLint validation (required before commits) |
+| `npm run test:unit` | Run the fast unit suite (`node --test`), required before commits |
 | `npm run test:e2e` | Run the Playwright end-to-end tests |
 | `npm run pack` | Development build without packaging (`electron-builder --dir`) |
 | `npm run dist:linux` | Build Linux packages (AppImage, deb, rpm, snap) |
 | `npm run dist` | Build all configured platforms |
 | `npm run generate-ipc-docs` | Regenerate the IPC API docs after changing an IPC channel |
+| `npm run generate-config-docs` | Regenerate the configuration reference and `config-schema.json` after editing `app/config/options.js` (CI checks for drift) |
 | `npm run generate-release-info` | Regenerate the release information file |
 
 See [Contributing](development/contributing.md) for the full development workflow.
@@ -37,12 +39,12 @@ Common options and what they control. Names link to the full reference for curre
 
 | Option | Purpose |
 |--------|---------|
-| `disableGpu` | Turn GPU/hardware acceleration off. On Wayland the app already disables the GPU by default, so set this to `false` to force it back on; the main lever for blank-window and rendering issues |
-| `notificationMethod` | Choose how notifications are delivered: `web`, `electron`, or `custom` |
-| `closeAppOnCross` | Quit the app on window close instead of minimising to tray |
-| `trayIconEnabled` | Show or hide the system tray icon |
-| `emulateWinChromiumPlatform` | Present a Windows Chromium user agent (workaround for Teams gating features by platform) |
-| `proxyServer` | Route traffic through a proxy in `address:port` form |
+| `performance.disableGpu` | Turn GPU/hardware acceleration off. On Wayland the app already disables the GPU by default, so set this to `false` to force it back on; the main lever for blank-window and rendering issues |
+| `notifications.method` | Choose how notifications are delivered: `web`, `electron`, or `custom` |
+| `window.closeOnCross` | Quit the app on window close instead of minimising to tray |
+| `tray.enabled` | Show or hide the system tray icon |
+| `platform.emulateWindowsChromium` | Present a Windows Chromium user agent (workaround for Teams gating features by platform) |
+| `network.proxyServer` | Route traffic through a proxy in `address:port` form |
 
 For every option, including the ones not listed here, see [Configuration Options](configuration.md).
 

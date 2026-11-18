@@ -1,21 +1,20 @@
+"use strict";
+
 const ReactHandler = require("./reactHandler");
 
-let _Settings_config = new WeakMap();
-let _Settings_ipcRenderer = new WeakMap();
+// ipcRenderer is used in init only and never stored: page script can patch
+// WeakMap.prototype.set and read anything on `this` (GHSA-58j7-22f8-6xqp).
 class Settings {
+  #config;
+
   init(config, ipcRenderer) {
-    _Settings_config.set(this, config);
-    _Settings_ipcRenderer.set(this, ipcRenderer);
-    this.ipcRenderer.on("get-teams-settings", retrieve);
-    this.ipcRenderer.on("set-teams-settings", restore);
+    this.#config = config;
+    ipcRenderer.on("get-teams-settings", retrieve);
+    ipcRenderer.on("set-teams-settings", restore);
   }
 
   get config() {
-    return _Settings_config.get(this);
-  }
-
-  get ipcRenderer() {
-    return _Settings_ipcRenderer.get(this);
+    return this.#config;
   }
 }
 
@@ -24,13 +23,11 @@ function validateSettingsInput(settings) {
     return false;
   }
   
-  // Validate theme input
   if (settings.theme && !['default', 'dark', 'light'].includes(settings.theme)) {
     console.warn('Settings: Invalid theme value:', settings.theme);
     return false;
   }
-  
-  // Validate chatDensity input
+
   if (settings.chatDensity && !['compact', 'comfy'].includes(settings.chatDensity)) {
     console.warn('Settings: Invalid chatDensity value:', settings.chatDensity);
     return false;
@@ -48,7 +45,6 @@ async function retrieve(event) {
       return;
     }
     
-    // Validate that clientPreferences has expected structure
     if (!clientPreferences.theme || !clientPreferences.density) {
       console.error("Settings: Invalid client preferences structure");
       return;
@@ -59,7 +55,6 @@ async function retrieve(event) {
       chatDensity: clientPreferences.density.chatDensity,
     };
     
-    // Validate extracted settings before sending
     if (validateSettingsInput(settings)) {
       event.sender.send("get-teams-settings", settings);
     } else {
@@ -72,7 +67,6 @@ async function retrieve(event) {
 
 async function restore(event, ...args) {
   try {
-    // Validate input arguments
     if (!args[0] || typeof args[0] !== 'object') {
       console.error("Settings: Invalid restore arguments");
       return;
@@ -90,7 +84,6 @@ async function restore(event, ...args) {
       return;
     }
     
-    // Validate that clientPreferences has expected structure
     if (!clientPreferences.theme || !clientPreferences.density) {
       console.error("Settings: Invalid client preferences structure for restore");
       return;

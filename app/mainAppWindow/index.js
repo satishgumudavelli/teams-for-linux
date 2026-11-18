@@ -6,7 +6,6 @@ const {
   dialog,
   webFrameMain,
   nativeImage,
-  desktopCapturer,
   ipcMain,
   MessageChannelMain,
 } = require("electron");
@@ -15,16 +14,27 @@ const login = require("../login");
 const customCSS = require("../customCSS");
 const Menus = require("../menus");
 const { SpellCheckProvider } = require("../spellCheckProvider");
+const { writeStoredOption } = require("../config/renames");
 const { execFile } = require("node:child_process");
 const TrayIconChooser = require("../browser/tools/trayIconChooser");
 require("../appConfiguration");
 const ConnectionManager = require("../connectionManager");
+const ssoPasswordPrefill = require("../ssoPasswordPrefill");
 const BrowserWindowManager = require("../mainAppWindow/browserWindowManager");
 const { injectTeamsPresence } = require("../browser/teamsPresenceInjection");
+const deepLinkRouter = require("./deepLinkRouter");
+const { DeferredDeepLink } = require("./deferredDeepLink");
+const { resolveLaunchUrl } = require("./protocolLink");
 const os = require("node:os");
 const path = require("node:path");
+const { installProfileWindowOpenHandler } = require("./profileWindowOpenPolicy");
+const { reloadIfSignedOut } = require("./signOutReload");
+const { keepMsalEncryptionCookiePersistent } = require("./msalCookiePersistence");
+const {
+  isDocumentPictureInPictureRequest,
+  documentPictureInPictureResponse,
+} = require("./documentPictureInPicture");
 
-// Default configuration for the screen sharing thumbnail preview (avoid magic values)
 const DEFAULT_SCREEN_SHARING_THUMBNAIL_CONFIG = {
   enabled: true,
   alwaysOnTop: true,
@@ -33,8 +43,8 @@ const DEFAULT_SCREEN_SHARING_THUMBNAIL_CONFIG = {
 let iconChooser;
 let intune;
 let isControlPressed = false;
-// Phase 1c.2: ProfilesManager handle threaded through onAppReady so the
-// Menus instance can build the Profiles submenu and react to its events.
+// ProfilesManager handle threaded through onAppReady so the Menus
+// instance can build the Profiles submenu and react to its events.
 let profilesManagerRef = null;
 // Counter for tracking about:blank navigation attempts to handle authentication flows.
 // Teams sometimes navigates to about:blank during SSO/auth redirects, and we need to
@@ -48,19 +58,30 @@ let streamSelector;
 let screenSharingService = null;
 let connectionManager = null;
 let menus = null;
+let browserWindowManager = null;
+// Page title of the profile view currently shown over the root window, or
+// null while Profile 0 is (see setTitleOverride).
+let titleOverride = null;
 
 const isMac = os.platform() === "darwin";
 
-function findSelectedSource(sources, source) {
-  return sources.find((s) => s.id === source.id);
+function setupScreenSharing(selectedSource) {
+  screenSharingService.setSelectedSource(selectedSource);
+  createScreenSharePreviewWindow();
 }
 
-function setupScreenSharing(selectedSource) {
-  // Store the source ID in the screen sharing service
-  screenSharingService.setSelectedSource(selectedSource);
-
-  // Create preview window for screen sharing
-  createScreenSharePreviewWindow();
+// Install the profile-view window-open policy on a webContents (a profile
+// view or one of its descendants). Teams deep links load into
+// `loadTargetWebContents` — the originating profile view — never the root
+// window, which is a different profile. Profile views previously had no
+// handler at all; see profileWindowOpenPolicy.js for what is deliberately
+// still left on Electron's default and why.
+function bindWindowOpenHandler(targetWebContents, loadTargetWebContents, activate) {
+  installProfileWindowOpenHandler(targetWebContents, {
+    config,
+    loadTargetWebContents,
+    activate,
+  });
 }
 
 // Register the in-app screen-share picker on a given session. `setDisplayMediaRequestHandler`
@@ -86,47 +107,40 @@ function bindDisplayMediaHandler(targetSession) {
 }
 
 function handleScreenSourceSelection(source, callback) {
-  desktopCapturer
-    .getSources({ types: ["window", "screen"] })
-    .then((sources) => {
-      const selectedSource = findSelectedSource(sources, source);
-      if (selectedSource) {
-        setupScreenSharing(selectedSource);
-        callback({ video: selectedSource });
-      } else {
-        // Source not found - use setImmediate and try-catch to allow retry
-        setImmediate(() => {
-          try {
-            callback({});
-          } catch {
-            console.debug("[SCREEN_SHARE] Selected source not found");
-          }
-        });
-      }
-    })
-    .catch((error) => {
-      // Handle desktopCapturer failures gracefully - can crash on certain hardware
-      // configurations (USB-C docking stations, DisplayLink drivers, etc.)
-      // See issues #2058, #2041
-      console.error("[SCREEN_SHARE] Failed to get sources for selection:", {
-        error: error.message,
-        stack: error.stack,
-        sourceId: source?.id
-      });
-      setImmediate(() => {
-        try {
-          callback({});
-        } catch {
-          console.debug("[SCREEN_SHARE] Failed to complete screen selection callback");
-        }
-      });
+  try {
+    // Use the picker's source directly instead of re-querying
+    // desktopCapturer.getSources(). On Wayland/PipeWire every getSources()
+    // call opens a fresh portal session with new source IDs, so an ID from
+    // the picker's enumeration never matched a second enumeration and
+    // sharing always failed. See #2713 (and #2207 for the original attempt).
+    setupScreenSharing(source);
+  } catch (error) {
+    console.error("[SCREEN_SHARE] Failed to setup screen sharing:", {
+      error: error.message,
+      sourceId: source?.id,
     });
+    setImmediate(() => {
+      try {
+        callback({});
+      } catch {
+        console.debug("[SCREEN_SHARE] Failed to complete screen selection callback");
+      }
+    });
+    return;
+  }
+
+  // Kept out of the try above so a throwing callback is not mistaken for a
+  // setup failure and answered with a second callback.
+  try {
+    callback({ video: { id: source.id, name: source.name || "" } });
+  } catch {
+    console.debug("[SCREEN_SHARE] Failed to complete screen selection callback");
+  }
 }
 
 function createScreenSharePreviewWindow() {
   const startTime = Date.now();
 
-  // Get configuration - use the module-level config variable
   let thumbnailConfig =
     config?.screenSharing?.thumbnail ?? DEFAULT_SCREEN_SHARING_THUMBNAIL_CONFIG;
 
@@ -183,7 +197,6 @@ function createScreenSharePreviewWindow() {
     },
   });
 
-  // Store in service
   screenSharingService.setPreviewWindow(newPreviewWindow);
 
   const windowId = newPreviewWindow.id;
@@ -207,7 +220,6 @@ function createScreenSharePreviewWindow() {
     newPreviewWindow.show();
   });
 
-  // Add focus/blur event handlers to detect when preview window gets focus
   newPreviewWindow.on("focus", () => {
     console.debug("[SCREEN_SHARE_DIAG] Preview window gained focus", {
       windowId: windowId,
@@ -228,7 +240,6 @@ function createScreenSharePreviewWindow() {
       hadActiveSource: !!closedSource,
       closedSource: closedSource
     });
-    // Clear both preview window and selected source when window closes
     screenSharingService.setPreviewWindow(null);
     screenSharingService.setSelectedSource(null);
   });
@@ -273,6 +284,7 @@ const AUTH_COOKIE_NAMES = new Set([
   'CCState',
   'FedAuth',
   'rtFa',
+  'msal.cache.encryption',
 ]);
 
 // Auth cookies preserved during force-clean recovery so the Microsoft
@@ -484,6 +496,16 @@ let firstMidCallWorkerSignalAt = 0;
 let reauthPromptShownForCall = false;
 let reauthPromptOpen = false;
 let recoveryQueuedForCallEnd = false;
+// A deep link the SPA declined during a call: the fallback reload would end
+// the call, so the link waits for the call to end, as auth recovery does.
+// Same teardown delay as the queued recovery.
+const CALL_TEARDOWN_DELAY_MS = 5000;
+const deferredDeepLink = new DeferredDeepLink(
+  (url) => openDeepLink(url).catch(() => console.debug('[DEEPLINK] deferred navigation failed')),
+  CALL_TEARDOWN_DELAY_MS
+);
+// Bumped per `openDeepLink` call: after its await, only the newest call may fall back.
+let deepLinkGeneration = 0;
 // A single transient worker UPR must not prompt (#2428); require the worker
 // signals to persist this long into the same call before treating them as a
 // genuine mid-call auth failure.
@@ -670,9 +692,11 @@ exports.onAppReady = async function onAppReady(configGroup, customBackground, sh
     }
   }
 
-  const browserWindowManager = new BrowserWindowManager({
+  browserWindowManager = new BrowserWindowManager({
     config: config,
     iconChooser: iconChooser,
+    // Lets the startup clear reach every profile partition (#2866).
+    profilesManager: profilesManagerRef,
   });
 
   window = await browserWindowManager.createWindow();
@@ -689,18 +713,21 @@ exports.onAppReady = async function onAppReady(configGroup, customBackground, sh
 
   bindDisplayMediaHandler(window.webContents.session);
 
-  // #2534: when the renderer signals that screen sharing has started, make
-  // sure the preview window is open and connect the two renderers with a
-  // direct MessagePort. The Teams-side script pumps VideoFrames from the
-  // active screen-share track through it; the preview window reconstructs the
-  // stream on the other end via MediaStreamTrackGenerator. This avoids a
+  // #2534: the Teams-side script pumps VideoFrames from the active
+  // screen-share track through a MessagePort; the preview window reconstructs
+  // the stream on the other end via MediaStreamTrackGenerator. This avoids a
   // second getUserMedia/portal call (which on Wayland needs a PipeWire token
   // we cannot reuse) and means one capture feeds both Teams and the preview.
   // The 'screen-sharing-started' / 'screen-sharing-stopped' channels are a
   // broadcast: ScreenSharingService updates internal state, MQTTMediaStatusService
   // publishes to the broker, and this listener wires the MessagePort. Adding
   // another ipcMain.on here is the established pattern, not a duplication.
-  ipcMain.on("screen-sharing-started", () => {
+
+  // Opens the screen-share preview window (if enabled) and connects the
+  // Teams renderer to it with a direct MessagePort so a single capture
+  // feeds both windows (#2534). One of several listeners on this broadcast
+  // channel; see the rationale above.
+  ipcMain.on("screen-sharing-started", (event) => {
     if (!window || window.isDestroyed()) return;
     createScreenSharePreviewWindow();
     const previewWindow = screenSharingService.getPreviewWindow();
@@ -710,8 +737,18 @@ exports.onAppReady = async function onAppReady(configGroup, customBackground, sh
     }
     const postPorts = () => {
       try {
+        // The sharing renderer owns the capture and relays the snapshots, so
+        // the port must go to it, not to the root window: a share started in
+        // a multi-account profile view would otherwise leave the preview with
+        // no frame source and paint black (#2979). postPorts can be deferred
+        // to the preview window's did-finish-load, so the sender may be gone.
+        const sender = event.sender;
+        if (!sender || sender.isDestroyed()) {
+          console.debug("[SCREEN_SHARE_DIAG] Sharing renderer gone before port wiring - skipping");
+          return;
+        }
         const { port1, port2 } = new MessageChannelMain();
-        window.webContents.postMessage("screen-share-port", null, [port1]);
+        sender.postMessage("screen-share-port", null, [port1]);
         previewWindow.webContents.postMessage("screen-share-port", null, [port2]);
         console.debug("[SCREEN_SHARE_DIAG] Posted MessagePort to Teams renderer and preview window");
       } catch (error) {
@@ -727,7 +764,6 @@ exports.onAppReady = async function onAppReady(configGroup, customBackground, sh
     }
   });
 
-  // Initialize connection manager
   connectionManager = new ConnectionManager();
 
   if (iconChooser) {
@@ -736,6 +772,10 @@ exports.onAppReady = async function onAppReady(configGroup, customBackground, sh
   }
 
   addEventHandlers();
+
+  // Keep the msal.cache.encryption cookie
+  // Run before loading Teams so the cookie gets caught right at the start
+  keepMsalEncryptionCookiePersistent(window.webContents.session, config);
 
   // Clean expired auth cookies before loading Teams to prevent the
   // "We need you to sign in again" stale banner (#2296)
@@ -758,6 +798,14 @@ exports.onAppReady = async function onAppReady(configGroup, customBackground, sh
     callActive = false;
     resetMidCallAuthState();
     if (recoveryQueuedForCallEnd) {
+      // Recovery clears the session and reloads at the same deadline; a link
+      // opened alongside it would be replaced mid-load, so recovery wins.
+      deferredDeepLink.cancel();
+    } else if (deferredDeepLink.pending) {
+      console.info('[DEEPLINK] Call ended, opening the deferred link');
+      deferredDeepLink.release();
+    }
+    if (recoveryQueuedForCallEnd) {
       recoveryQueuedForCallEnd = false;
       console.info('[AUTH_RECOVERY] Call ended, running queued recovery');
       // Short delay so the call teardown finishes before the reload
@@ -778,6 +826,9 @@ exports.onAppReady = async function onAppReady(configGroup, customBackground, sh
     callActive = false;
     resetMidCallAuthState();
     recoveryQueuedForCallEnd = false;
+    // The window moved on: a link still waiting, or released and not yet
+    // opened, would land on top of wherever this navigation went.
+    deferredDeepLink.cancel();
   });
   window.webContents.on('console-message', (event) => {
     maybeScheduleAuthRecovery(event.message, event.sourceId);
@@ -795,7 +846,7 @@ exports.onAppReady = async function onAppReady(configGroup, customBackground, sh
 };
 
 function onSpellCheckerLanguageChanged(languages) {
-  appConfig.legacyConfigStore.set("spellCheckerLanguages", languages);
+  writeStoredOption(appConfig.legacyConfigStore, "spellCheckerLanguages", languages);
 }
 
 let allowFurtherRequests = true;
@@ -817,11 +868,24 @@ exports.show = function () {
 // "restore" (issue #2647).
 exports.restoreWindow = restoreWindow;
 
+// The tray is created inside Menus during onAppReady; Phase 2's unread
+// aggregator attaches to it afterwards. Null when trayIconEnabled is off.
+exports.getTray = function () {
+  return menus?.tray ?? null;
+};
+
 exports.getWindow = function () {
   return window;
 };
 
+exports.performIncomingCallAction = function (action) {
+  return browserWindowManager?.performIncomingCallAction(action) === true;
+};
+
 exports.bindDisplayMediaHandler = bindDisplayMediaHandler;
+exports.bindWindowOpenHandler = bindWindowOpenHandler;
+exports.injectScreenSharingLogic = injectScreenSharingLogic;
+exports.setTitleOverride = setTitleOverride;
 
 exports.setQuickChatManager = function (quickChatManager) {
   if (menus) {
@@ -831,7 +895,7 @@ exports.setQuickChatManager = function (quickChatManager) {
 
 exports.onAppSecondInstance = function onAppSecondInstance(event, args) {
   console.debug("second-instance started");
-  if (window) {
+  if (window && !window.isDestroyed()) {
     event.preventDefault();
     const url = processArgs(args);
     if (url && allowFurtherRequests) {
@@ -839,12 +903,62 @@ exports.onAppSecondInstance = function onAppSecondInstance(event, args) {
       setTimeout(() => {
         allowFurtherRequests = true;
       }, 5000);
-      window.loadURL(url, { userAgent: config.chromeUserAgent });
+      // `loadURL` rejects with ERR_ABORTED whenever Teams redirects the
+      // navigation it started, and the main process exits on
+      // unhandledRejection. The error is dropped rather than logged because it
+      // carries the deep link, and with it the recipient or meeting.
+      openDeepLink(url).catch(() => {
+        console.debug("[DEEPLINK] navigation failed");
+      });
     }
 
     restoreWindow();
   }
 };
+
+/**
+ * Opens a deep link, preferring in-page routing over a full navigation.
+ *
+ * A full `loadURL` discards the running SPA and cold-boots it, which is the
+ * multi-second delay between activating a link and seeing the target. Launcher
+ * links route through the loaded SPA instead, and anything it does not consume
+ * falls back to the full navigation.
+ *
+ * @param {string} url - Deep link URL resolved from the launch argument
+ */
+async function openDeepLink(url) {
+  // The newest link wins, whichever way it ends up opening: one held from
+  // earlier must not open over it, and the full navigation below can outlast
+  // the release delay before `did-navigate` would get to cancel it.
+  deferredDeepLink.cancel();
+  const generation = ++deepLinkGeneration;
+
+  const routed = await deepLinkRouter.navigateInPage(window, url, config.url);
+  if (routed) {
+    console.debug("[DEEPLINK] routed in page");
+    const { focused, afterMs } = await deepLinkRouter.focusCompose(window, url, config.url);
+    const outcome = focused ? `focused after ${afterMs} ms` : "not found";
+    console.debug(`[DEEPLINK] compose box ${outcome}`);
+    return;
+  }
+
+  // A released link is not held off by the second-instance cooldown, so a
+  // newer one can arrive during the wait above; it owns the fallback then.
+  if (generation !== deepLinkGeneration) {
+    console.debug("[DEEPLINK] superseded by a newer link, fallback skipped");
+    return;
+  }
+
+  if (callActive) {
+    // Only the URL is kept, never logged: it carries the recipient or meeting.
+    console.info("[DEEPLINK] in-page routing unavailable during a call, deferring to the call end");
+    deferredDeepLink.defer(url);
+    return;
+  }
+
+  console.debug("[DEEPLINK] in-page routing unavailable, reloading");
+  await window.loadURL(url, { userAgent: config.chromeUserAgent });
+}
 
 function applyAppConfiguration(config, window) {
   applySpellCheckerConfiguration(config.spellCheckerLanguages, window);
@@ -904,6 +1018,10 @@ function onDidFinishLoad() {
     return;
   }
 
+  if (reloadIfSignedOut(window.webContents, config.url, config.chromeUserAgent)) {
+    return;
+  }
+
   window.webContents.executeJavaScript(`
 			openBrowserButton = document.querySelector('[data-tid=joinOnWeb]');
 			openBrowserButton && openBrowserButton.click();
@@ -913,15 +1031,18 @@ function onDidFinishLoad() {
 			tryAgainLink && tryAgainLink.click()
 		`).catch(() => {});
 
-  // Inject browser functionality
-  injectScreenSharingLogic();
+  injectScreenSharingLogic(window.webContents);
   injectTeamsPresence(window.webContents, config);
 
-  customCSS.onDidFinishLoad(window.webContents, config);
+  customCSS.onDidFinishLoad(window.webContents, config, appConfig.customCSSPath);
   initSystemThemeFollow(config);
 }
 
-function injectScreenSharingLogic() {
+// Runs the screen-sharing script (audio stripping, preview relay, stop-button
+// monitoring) in the given Teams webContents. Called for the root window here
+// and for each multi-account profile view by ProfileViewManager, which
+// otherwise shared with Teams' raw constraints (#2979).
+function injectScreenSharingLogic(webContents) {
   const fs = require("node:fs");
   const scriptPath = path.join(
     __dirname,
@@ -931,7 +1052,12 @@ function injectScreenSharingLogic() {
   );
   try {
     const script = fs.readFileSync(scriptPath, "utf8");
-    window.webContents.executeJavaScript(script).catch((err) => {
+    const resolutionConfig = config?.screenSharing?.resolution ?? {
+      enabled: false,
+      mode: "remove",
+    };
+    const configScript = `globalThis.__tflScreenSharingResolution = ${JSON.stringify(resolutionConfig)};`;
+    webContents.executeJavaScript(`${configScript}\n${script}`).catch((err) => {
       console.error("[SCREEN_SHARE] Failed to execute injected script:", err.message);
     });
   } catch (err) {
@@ -969,59 +1095,37 @@ function onDidFrameFinishLoad(
   }
 
   const wf = webFrameMain.fromId(frameProcessId, frameRoutingId);
-  customCSS.onDidFrameFinishLoad(wf, config);
+  customCSS.onDidFrameFinishLoad(wf, config, appConfig.customCSSPath);
 }
 
 function restoreWindow() {
-  // If minimized, restore.
   if (window.isMinimized()) {
     window.restore();
-  }
-
-  // If closed to tray, show.
-  else if (!window.isVisible()) {
+  } else if (!window.isVisible()) {
     window.show();
   }
 
   window.focus();
+  // A second instance has no user activation, so window.focus() alone can be
+  // refused as focus stealing; app.focus() raises the first visible window on
+  // X11 (Wayland may only flash the icon, which is the platform's call).
+  app.focus();
 }
 
 /**
- * Processes command line arguments to extract Teams URLs and protocol handlers.
- * Handles both msteams:// protocol links and HTTPS URLs that match the Teams domain pattern.
- * This enables deep linking into Teams conversations, meetings, and channels.
+ * Processes command line arguments to extract Teams URLs and protocol handlers,
+ * and shows the window when one is found. The matching lives in
+ * `resolveLaunchUrl` so it can be tested without Electron.
  *
  * @param {string[]} args - Command line arguments to process
  * @returns {string|null} Processed URL to navigate to, or null if no valid URL found
  */
 function processArgs(args) {
-  // Legacy Teams protocol format: msteams:/l/meetup-join/...
-  const v1msTeams = new RegExp(config.msTeamsProtocols.v1);
-  // Modern Teams protocol format: msteams://teams.microsoft.com/l/...
-  const v2msTeams = new RegExp(config.msTeamsProtocols.v2);
-  console.debug("processArgs:", args);
-  for (const arg of args) {
-    console.debug(
-      `testing RegExp processArgs ${new RegExp(config.meetupJoinRegEx).test(
-        arg
-      )}`
-    );
-    if (new RegExp(config.meetupJoinRegEx).test(arg)) {
-      console.debug("A url argument received with https protocol");
-      window.show();
-      return arg;
-    }
-    if (v1msTeams.test(arg)) {
-      console.debug("A url argument received with msteams v1 protocol");
-      window.show();
-      return config.url + arg.substring(8, arg.length);
-    }
-    if (v2msTeams.test(arg)) {
-      console.debug("A url argument received with msteams v2 protocol");
-      window.show();
-      return arg.replace("msteams", "https");
-    }
+  const url = resolveLaunchUrl(args, config);
+  if (url) {
+    window.show();
   }
+  return url;
 }
 
 // Microsoft telemetry / beacon hosts that are not required for Teams to
@@ -1048,7 +1152,7 @@ function isMicrosoftTelemetryHost(url) {
   // fires for every request matched by `{ urls: ["https://*/*"] }`, so
   // skipping the parse for the overwhelmingly common non-telemetry case
   // is measurable on chat-heavy sessions.
-  if (!url || !url.includes(MS_TELEMETRY_FAST_PATH)) return false;
+  if (!url?.includes(MS_TELEMETRY_FAST_PATH)) return false;
   try {
     const hostname = new URL(url).hostname;
     return MS_TELEMETRY_HOSTS.some(
@@ -1070,10 +1174,7 @@ function onBeforeRequestHandler(details, callback) {
 
   if (customBackgroundRedirect) {
     callback(customBackgroundRedirect);
-  }
-  // Check if the counter was incremented
-  else if (aboutBlankRequestCount < 1) {
-    // Proceed normally
+  } else if (aboutBlankRequestCount < 1) {
     callback({});
   } else if (details.resourceType === "mainFrame") {
     // A top-level navigation is never the about:blank popup's own request, so
@@ -1108,7 +1209,6 @@ function onBeforeRequestHandler(details, callback) {
       child.destroy();
     });
 
-    // decrement the counter
     aboutBlankRequestCount -= 1;
     callback({ cancel: true });
   }
@@ -1209,6 +1309,13 @@ function onBeforeSendHeadersHandler(detail, callback) {
 }
 
 function onNewWindow(details) {
+  // Must precede the about:blank handling below (auth breadcrumb and deny):
+  // the Document PiP replacement opens an about:blank popup that Teams renders
+  // its call controls into.
+  if (isDocumentPictureInPictureRequest(details, config)) {
+    return documentPictureInPictureResponse();
+  }
+
   // Breadcrumb for diagnosing which shape of popup the "sign in again"
   // banner opens (about:blank-then-navigate vs a direct login URL) — the two
   // take different paths below and only the direct form can be intercepted
@@ -1235,7 +1342,6 @@ function onNewWindow(details) {
     details.url === "about:blank" ||
     details.url === "about:blank#blocked"
   ) {
-    // Increment the counter for about:blank authentication flow
     aboutBlankRequestCount += 1;
     return { action: "deny" };
   } else if (isAuthLoginUrl(details.url) && shouldInterceptAuthPopup()) {
@@ -1257,8 +1363,42 @@ function onNewWindow(details) {
   return secureOpenLink(details);
 }
 
-function onPageTitleUpdated(_event, title) {
+// A custom app.title replaces the trailing "Microsoft Teams" in the window
+// title (or is appended when Teams omits it) so multiple instances can be
+// told apart in taskbars and Alt+Tab (#3035). The default leaves the page
+// title untouched.
+function formatWindowTitle(title) {
+  const defaultTitle = "Microsoft Teams";
+  if (!config.appTitle || config.appTitle === defaultTitle) return title;
+  return title.endsWith(defaultTitle)
+    ? title.slice(0, -defaultTitle.length) + config.appTitle
+    : `${title} - ${config.appTitle}`;
+}
+
+function onPageTitleUpdated(event, title) {
   window.webContents.send("page-title", title);
+  // While another profile's view is shown its title owns the window, so
+  // Profile 0's background updates must not replace it (#3068).
+  if (titleOverride !== null) {
+    event.preventDefault();
+    return;
+  }
+  // The default app.title leaves Electron mirroring document.title.
+  const windowTitle = formatWindowTitle(title);
+  if (windowTitle !== title) {
+    event.preventDefault();
+    window.setTitle(windowTitle);
+  }
+}
+
+// Multi-account: ProfileViewManager passes the active profile view's page
+// title, or null when Profile 0 (the root webContents) is shown again. A
+// null while Profile 0 already owns the title leaves it alone.
+function setTitleOverride(title) {
+  if (title === null && titleOverride === null) return;
+  titleOverride = title;
+  if (!window || window.isDestroyed()) return;
+  window.setTitle(formatWindowTitle(title ?? window.webContents.getTitle()));
 }
 
 function onNavigationChanged() {
@@ -1327,6 +1467,10 @@ function addEventHandlers() {
   // Navigation state change handlers
   window.webContents.on("did-navigate", onNavigationChanged);
   window.webContents.on("did-navigate-in-page", onNavigationChanged);
+
+  // Pre-fill/advance the Microsoft/federated web login page (no-op unless one
+  // of auth.webLogin.user / auth.webLogin.passwordCommand / auth.webLogin.verifyMethod is set).
+  ssoPasswordPrefill.attach(window, config);
 }
 
 function getWebRequestFilterFromURL() {
@@ -1407,7 +1551,18 @@ function secureOpenLink(details) {
 
 function openInBrowser(details) {
   if (config.defaultURLHandler.trim() === "") {
-    shell.openExternal(details.url);
+    // A scheme with no handling app rejects; uncaught, that reaches the
+    // process-wide unhandledRejection handler and exits the app.
+    // Only the scheme is logged: the OS error message can echo the URL.
+    shell.openExternal(details.url).catch(() => {
+      let scheme = "unparseable";
+      try {
+        scheme = new URL(details.url).protocol;
+      } catch {
+        // keep "unparseable"
+      }
+      console.error("[LINK] Could not open link externally", { scheme });
+    });
   } else {
     execFile(
       config.defaultURLHandler.trim(),

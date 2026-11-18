@@ -20,6 +20,20 @@ function ensureIpcHandlers() {
     if (!activeHandlers) return;
     return activeHandlers.onRename(payload);
   });
+  // Pin/unpin toggle from the renderer. Request/response so the renderer can
+  // await and surface a rejection (e.g. the max-5 pinned cap) without losing
+  // dialog state. Payload carries the profile `id` and the desired `pinned`.
+  ipcMain.handle("manage-profile-pin", async (_event, payload) => {
+    if (!activeHandlers) return;
+    return activeHandlers.onPin(payload);
+  });
+  // Per-profile notification and sound toggles (ADR-020 Phase 2). Same
+  // request/response shape as pin. Payload: the profile `id` plus
+  // `disableNotifications` and/or `muted`.
+  ipcMain.handle("manage-profile-notifications", async (_event, payload) => {
+    if (!activeHandlers) return;
+    return activeHandlers.onNotifications(payload);
+  });
   // Remove request from the renderer; main shows the destructive confirmation
   // before forwarding to ProfilesManager.
   ipcMain.on("manage-profile-remove", (_event, id) => {
@@ -65,6 +79,8 @@ class ManageProfileDialog {
 
     activeHandlers = {
       onRename: this.#handleRename,
+      onPin: this.#handlePin,
+      onNotifications: this.#handleNotifications,
       onRemove: this.#handleRemove,
       onClose: this.#handleClose,
     };
@@ -105,6 +121,9 @@ class ManageProfileDialog {
     this.#window.webContents.send("manage-profile-state", {
       profiles,
       activeId,
+      // Ctrl+Alt+1…5 lives on the per-window menu, which macOS doesn't have —
+      // the pin buttons drop the chord labels when it can't fire.
+      shortcutsAvailable: process.platform !== "darwin",
     });
   }
 
@@ -124,7 +143,47 @@ class ManageProfileDialog {
         typeof error?.message === "string" && error.message
           ? error.message
           : "Failed to rename profile.";
-      throw new Error(raw.replace(/^\[ProfilesManager\]\s*/, ""));
+      throw new Error(raw.replace(/^\[ProfilesManager\]\s*/, ""), { cause: error });
+    }
+  };
+
+  #handlePin = ({ id, pinned }) => {
+    try {
+      this.#profilesManager.update(id, { pinned: !!pinned });
+      // Success: "update" fires, the menu re-slots accelerators and the
+      // dialog re-renders via #pushState.
+      return { ok: true };
+    } catch (error) {
+      // Return the failure rather than throwing: a rejection crossing
+      // ipcMain.handle gets wrapped in Electron's "Error invoking remote
+      // method…" prefix, which would leak into the dialog's error line.
+      const raw =
+        typeof error?.message === "string" && error.message
+          ? error.message
+          : "Failed to update pin.";
+      return { ok: false, error: raw.replace(/^\[ProfilesManager\]\s*/, "") };
+    }
+  };
+
+  #handleNotifications = ({ id, disableNotifications, muted } = {}) => {
+    const patch = {};
+    if (typeof disableNotifications === "boolean") {
+      patch.disableNotifications = disableNotifications;
+    }
+    if (typeof muted === "boolean") patch.muted = muted;
+    if (Object.keys(patch).length === 0) {
+      return { ok: false, error: "Nothing to update." };
+    }
+    try {
+      this.#profilesManager.update(id, patch);
+      return { ok: true };
+    } catch (error) {
+      // Returned, not thrown, for the same reason as #handlePin.
+      const raw =
+        typeof error?.message === "string" && error.message
+          ? error.message
+          : "Failed to update notifications.";
+      return { ok: false, error: raw.replace(/^\[ProfilesManager\]\s*/, "") };
     }
   };
 

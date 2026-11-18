@@ -5,7 +5,18 @@ const supportedEvents = new Set([
   "incoming-call-created",
   "incoming-call-ended",
   "call-connected",
-  "call-disconnected"
+  "call-disconnected",
+  "meeting-started"
+]);
+// crossClientScenarioName values Teams gives the toast for a ringing call.
+// Any other toast with isIncomingCall set (the dismissal carries null) means
+// the ringing has ended. A call from a phone number is "incoming_pstn_call"
+// (#3019); the two call-queue names are taken from the Teams client.
+const incomingCallScenarios = new Set([
+  "incoming_call",
+  "incoming_pstn_call",
+  "incoming_call_queue_call",
+  "conference_incoming_call_queue_call"
 ]);
 
 class ActivityHub {
@@ -37,6 +48,30 @@ class ActivityHub {
         console.error(`ActivityHub: handler for '${event}' threw:`, err);
       }
     }
+  }
+
+  /**
+   * Exposed for unit tests: classify a command-stream entityOptions payload
+   * as a meeting start (returns its stable id) or not (null).
+   */
+  getMeetingStartId(entityOptions) {
+    return getMeetingStartId(entityOptions);
+  }
+
+  /**
+   * Exposed for unit tests: whether a toast's crossClientScenarioName is
+   * one Teams uses for a call that is ringing.
+   */
+  isIncomingCallScenario(scenarioName) {
+    return isIncomingCallScenario(scenarioName);
+  }
+
+  /**
+   * Exposed for unit tests: the caller details published over MQTT for an
+   * incoming-call toast's entityOptions.
+   */
+  getIncomingCallDetails(entityOptions) {
+    return getIncomingCallDetails(entityOptions);
   }
 
   start() {
@@ -132,7 +167,7 @@ class ActivityHub {
         self.inactiveStartTime = null;
         self.setMachineState(state);
         self.setActive(
-          state == 1 && (self.current == 4 || self.current == 5)
+          state === 1 && (self.current === 4 || self.current === 5)
             ? 3
             : self.current,
         );
@@ -205,18 +240,118 @@ function assignEventHandlers(commandChangeReportingService) {
 }
 
 function handleCallEventEntityCommand(entityCommand) {
+  // #2587 spike diagnostic: record which toast scenarios flow through the
+  // command-reporting stream, to evaluate whether meeting-start toasts can be
+  // detected here (React store) instead of via DOM text matching. Scenario
+  // names are internal Teams enums, not PII.
+  console.debug('[MeetingStart] toast entityCommand scenario:',
+    entityCommand.entityOptions?.crossClientScenarioName,
+    { isIncomingCall: !!entityCommand.entityOptions?.isIncomingCall });
+  const meetingStartId = getMeetingStartId(entityCommand.entityOptions);
+  if (meetingStartId) {
+    onMeetingStarted(meetingStartId);
+  }
   if (entityCommand.entityOptions?.isIncomingCall) {
-    if ("incoming_call" === entityCommand.entityOptions?.crossClientScenarioName) {
+    if (isIncomingCallScenario(entityCommand.entityOptions?.crossClientScenarioName)) {
       // Gets triggered by incoming call.
       onIncomingCallCreated({
         caller: entityCommand.entityOptions.title,
         image: entityCommand.entityOptions.mainImage?.src,
-        text: entityCommand.entityOptions.text
+        text: entityCommand.entityOptions.text,
+        details: getIncomingCallDetails(entityCommand.entityOptions)
       });
     } else {
       // Gets triggered when incoming call toast gets dismissed regardless of accepting or declining the call
       onIncomingCallEnded();
     }
+  }
+}
+
+function isIncomingCallScenario(scenarioName) {
+  return incomingCallScenarios.has(scenarioName);
+}
+
+function isPhoneNumber(value) {
+  return typeof value === "string" && /^\+?\d[\d\s().-]*$/.test(value.trim());
+}
+
+/**
+ * Caller details for MQTT, from an incoming-call toast's entityOptions, as
+ * seen on phone and call-queue calls (#3019). For a caller with a phone
+ * number, title is the number as Teams formats it and text is their name when
+ * Teams can match one, or the number again when it cannot; for any other
+ * caller, title is taken to be their name. A call-queue toast names the queue
+ * in headerSubtitle. In conference mode a call-queue toast is sent twice while
+ * ringing, the first before the name and queue are known, so this is worked
+ * out afresh for every toast rather than once per call. Fields without a value
+ * are left out, and the caller's picture never goes in.
+ */
+function getIncomingCallDetails(entityOptions) {
+  if (!entityOptions) {
+    return {};
+  }
+  const { title, text, crossClientScenarioName: scenario } = entityOptions;
+  const details = {};
+  if (scenario) {
+    details.scenario = scenario;
+  }
+  if (isPhoneNumber(title)) {
+    details.number = title.trim();
+    if (text && !isPhoneNumber(text)) {
+      details.name = text;
+    }
+  } else if (title) {
+    details.name = title;
+  }
+  if (scenario?.includes("call_queue") && entityOptions.headerSubtitle) {
+    details.queue = entityOptions.headerSubtitle;
+  }
+  if (entityOptions.trustworthy) {
+    details.contact = entityOptions.trustworthy.trustReason === "CONTACT";
+  }
+  if (entityOptions.callId) {
+    details.callId = entityOptions.callId;
+  }
+  return details;
+}
+
+/**
+ * Scheduled-meeting-start detection (#2587), verified against a live meeting
+ * on 2026-07-28. Teams announces a started meeting through this command
+ * stream in two structured shapes, both locale-independent:
+ *
+ * 1. The live-meeting status bar banner: entityOptions.intentLevel is
+ *    'LiveMeetingStatus' (cause 'LIVE_MEETING_STATUS_BAR_*'), with the
+ *    callId under the Join action's entityOptions.
+ * 2. The meeting-start toast: a buttons[] entry whose
+ *    targetEntity.dataOptions.toastType is 'MeetingStart', with a toastId.
+ *
+ * Returns a stable identifier for the started meeting (used for dedup by
+ * the subscriber), or null when the command is not a meeting start.
+ */
+function getMeetingStartId(entityOptions) {
+  if (!entityOptions) {
+    return null;
+  }
+  if (entityOptions.intentLevel === "LiveMeetingStatus") {
+    const joinAction = (entityOptions.actions ?? []).find(
+      (a) => a?.command?.entityOptions?.callId
+    );
+    return joinAction?.command?.entityOptions?.callId ?? "live-meeting-status";
+  }
+  const toastButton = (entityOptions.buttons ?? []).find(
+    (b) => b?.targetEntity?.dataOptions?.toastType === "MeetingStart"
+  );
+  if (toastButton) {
+    return toastButton.targetEntity.dataOptions.toastId ?? "meeting-start-toast";
+  }
+  return null;
+}
+
+async function onMeetingStarted(meetingStartId) {
+  const handlers = getEventHandlers('meeting-started');
+  for (const handler of handlers) {
+    handler.handler({ id: meetingStartId });
   }
 }
 

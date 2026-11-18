@@ -4,10 +4,11 @@
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 2.7.x   | :white_check_mark: |
-| < 2.7   | :x:                |
+| Most recent published version (stable or pre-release) | :white_check_mark: |
+| Most recent stable version, while a newer pre-release exists | :white_check_mark: |
+| Older releases | :x:                |
 
-Only the latest release in the 2.7.x series receives security updates. Users should upgrade to the latest version to benefit from fixes.
+New releases ship as a pre-release first and are promoted to stable after a soak, so the most recent stable version stays covered until the pre-release is promoted. Fixes land in the next regular release rather than as backports to older versions, so upgrade to benefit from them. Current versions are listed on the [releases page](https://github.com/IsmaelMartinez/teams-for-linux/releases).
 
 ## Reporting a Vulnerability
 
@@ -18,6 +19,10 @@ If you discover a security vulnerability in Teams for Linux, please report it re
 3. Include a description of the vulnerability, steps to reproduce, and any potential impact.
 4. You can expect an initial response within 7 days.
 5. We will work with you to understand the issue and coordinate a fix and disclosure timeline.
+
+## Privacy & Data Protection
+
+For what personal data the application does and does not handle — and why the project processes none of its own — see the [Privacy & Data Protection statement](PRIVACY.md).
 
 ## Security Architecture
 

@@ -14,42 +14,45 @@ function applyCameraAspectRatioPatch() {
   let lastWindowSize = { width: window.innerWidth, height: window.innerHeight };
   const SIGNIFICANT_RESIZE_THRESHOLD = 100;
 
-  /**
-   * Fix aspect ratio on a video track by reapplying proper constraints
-   */
   async function fixVideoTrackAspectRatio(track) {
     if (track?.readyState !== "live") {
       return;
     }
 
+    // Callers fire this and forget it, so nothing below may throw uncaught.
+    let settings;
     try {
-      const settings = track.getSettings();
-      console.debug("[CAMERA_ASPECT_RATIO] Current track settings:", settings);
+      settings = track.getSettings();
+    } catch (error) {
+      console.warn("[CAMERA_ASPECT_RATIO] Failed to read track settings:", error.message);
+      return;
+    }
+    console.debug("[CAMERA_ASPECT_RATIO] Current track settings:", settings);
 
-      // Get the native camera resolution
-      const width = settings.width;
-      const height = settings.height;
+    const width = settings?.width;
+    const height = settings?.height;
 
-      if (!width || !height) {
-        console.debug("[CAMERA_ASPECT_RATIO] No dimensions available yet");
-        return;
-      }
+    if (!width || !height) {
+      console.debug("[CAMERA_ASPECT_RATIO] No dimensions available yet");
+      return;
+    }
 
-      // Calculate the proper aspect ratio from camera's native resolution
-      const nativeAspectRatio = width / height;
+    // Calculate the proper aspect ratio from camera's native resolution
+    const nativeAspectRatio = width / height;
 
-      console.debug(
-        `[CAMERA_ASPECT_RATIO] Track dimensions: ${width}x${height}, aspect ratio: ${nativeAspectRatio.toFixed(2)}`
-      );
+    console.debug(
+      `[CAMERA_ASPECT_RATIO] Track dimensions: ${width}x${height}, aspect ratio: ${nativeAspectRatio.toFixed(2)}`
+    );
 
-      // Reapply constraints with explicit aspect ratio
-      // This prevents Teams from messing with it when window size changes
-      const constraints = {
-        width: { ideal: width },
-        height: { ideal: height },
-        aspectRatio: { exact: nativeAspectRatio },
-      };
+    // Reapply constraints with explicit aspect ratio
+    // This prevents Teams from messing with it when window size changes
+    const constraints = {
+      width: { ideal: width },
+      height: { ideal: height },
+      aspectRatio: { exact: nativeAspectRatio },
+    };
 
+    try {
       await track.applyConstraints(constraints);
       console.debug(
         "[CAMERA_ASPECT_RATIO] Applied aspect ratio constraint:",
@@ -79,9 +82,6 @@ function applyCameraAspectRatioPatch() {
     }
   }
 
-  /**
-   * Monitor all video tracks in a MediaStream
-   */
   function monitorStream(stream) {
     const videoTracks = stream.getVideoTracks();
 
@@ -92,10 +92,8 @@ function applyCameraAspectRatioPatch() {
           `[CAMERA_ASPECT_RATIO] Monitoring video track: ${track.label}`
         );
 
-        // Apply initial fix
         fixVideoTrackAspectRatio(track);
 
-        // Clean up when track ends
         track.addEventListener("ended", () => {
           activeVideoTracks.delete(track);
           console.debug(
@@ -106,9 +104,6 @@ function applyCameraAspectRatioPatch() {
     }
   }
 
-  /**
-   * Intercept getUserMedia to monitor camera streams
-   */
   function interceptGetUserMedia() {
     const originalGetUserMedia = navigator.mediaDevices.getUserMedia.bind(
       navigator.mediaDevices
@@ -134,16 +129,12 @@ function applyCameraAspectRatioPatch() {
     console.debug("[CAMERA_ASPECT_RATIO] getUserMedia intercepted");
   }
 
-  /**
-   * Handle window resize/monitor change events
-   */
   async function handleWindowChange() {
     const currentSize = {
       width: window.innerWidth,
       height: window.innerHeight,
     };
 
-    // Check if this is a significant size change (not just minor resize)
     const widthChange = Math.abs(currentSize.width - lastWindowSize.width);
     const heightChange = Math.abs(currentSize.height - lastWindowSize.height);
 
@@ -188,10 +179,6 @@ function applyCameraAspectRatioPatch() {
   console.debug("[CAMERA_ASPECT_RATIO] Successfully initialized");
 }
 
-/**
- * Initialize the cameraAspectRatio tool
- * @param {Object} config - Application configuration
- */
 function init(config) {
   const aspectRatioConfig = config.media?.camera?.autoAdjustAspectRatio;
   if (!aspectRatioConfig?.enabled) {
